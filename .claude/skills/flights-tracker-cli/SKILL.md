@@ -46,8 +46,14 @@ flights search \
   --depart 2026-09-10 --return 2026-09-17 \
   --adults 1 --cabin economy \
   --market PL --locale pl-PL --currency PLN \
+  --depart-before 12:00 --return-after 17:00 \
   --sort price --limit 20 --json
 ```
+
+Time filters use local airport clocks (`HH:MM`):
+
+- `--depart-before` / `--depart-after` constrain the outbound departure
+- `--return-before` / `--return-after` constrain the return departure
 
 Treat a `partial` response with usable results as success. Read `partial_failures` and `warnings`, then tell the user which origins failed. Treat an empty `complete` result as a valid search with no offers.
 
@@ -69,7 +75,12 @@ flights search --request - --json <<'JSON'
   "market": "PL",
   "locale": "pl-PL",
   "currency": "PLN",
-  "filters": {"direct_only": false, "max_stops": 1},
+  "filters": {
+    "direct_only": false,
+    "max_stops": 1,
+    "depart_before": "12:00",
+    "return_after": "17:00"
+  },
   "sort": "price",
   "limit": 20
 }
@@ -93,7 +104,30 @@ flights alternative-dates \
 
 Each result includes `origin`, `departure_date`, `return_date`, `nights`, `price`, and `direct_price`. With `--direct`, only pairs that have a direct quote are kept and sorting uses `direct_price`. Use `--min-nights` / `--max-nights` when the user wants a similar trip length rather than 1-night outliers from the provider grid.
 
-Use alternative dates first when the user asks for nearby/flexible dates. Pick promising pairs from the grid, then run `flights search` for live itineraries and current prices. Do not present an alternative-date quote as a guaranteed bookable fare. Do not fan out many manual `search` calls until `alternative-dates` has been tried (or returned a real provider failure).
+## Flexible nearby-date search
+
+When the user asks for cheaper nearby dates and live itineraries, prefer one `flexible-search` instead of manually fan-outing many `search` calls:
+
+```bash
+flights flexible-search \
+  --origin WAW --origin POZ --origin GDN \
+  --destination ROM \
+  --depart 2026-09-25 --return 2026-09-29 \
+  --adults 1 --market PL --locale pl-PL --currency PLN \
+  --direct --min-nights 3 --max-nights 5 \
+  --date-candidates 5 \
+  --depart-before 12:00 --return-after 17:00 \
+  --limit 20 --timeout 120 --json
+```
+
+This command:
+
+1. builds an alternative-dates grid
+2. takes the cheapest `--date-candidates` pairs
+3. runs live `search` for each pair
+4. returns live itineraries plus `date_candidates` and per-result `date_pair` / `guide_price`
+
+Do not present an alternative-date guide quote as a guaranteed bookable fare. Use `flexible-search` first for flexible-date questions; fall back to separate `alternative-dates` + `search` only when you need more control.
 
 ## Process JSON
 

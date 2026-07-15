@@ -25,7 +25,7 @@
   "market": "PL",
   "locale": "pl-PL",
   "currency": "PLN",
-  "filters": {"direct_only": false, "max_stops": 1},
+  "filters": {"direct_only": false, "max_stops": 1, "depart_before": "12:00", "return_after": "17:00"},
   "sort": "price",
   "limit": 20
 }
@@ -38,6 +38,8 @@ Reguły walidacji:
 - miejsce tekstowe zawsze przechodzi Autosuggest; przy niejednoznaczności zwracane są `choices`, nie ciche zgadywanie;
 - maksymalna liczba originów i pasażerów powinna być jawnie ograniczona;
 - `direct_only` implikuje `max_stops: 0`.
+- filtry godzinowe `depart_after`, `depart_before`, `return_after`, `return_before` przyjmują lokalne `HH:MM` i są stosowane po normalizacji itineraries.
+- `flexible-search` najpierw buduje siatkę `alternative-dates`, bierze `date_candidates` (1-15) najtańszych par i dla każdej robi live `search`; wynik zawiera `date_candidates` oraz `date_pair`/`guide_price` przy ofertach.
 
 ## Wyjście search
 

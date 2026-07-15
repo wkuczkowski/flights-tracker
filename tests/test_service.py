@@ -6,10 +6,9 @@ import httpx
 import pytest
 
 from flights_tracker.errors import FlightsError
-from flights_tracker.cli import _alt_price, _alternative_sort_key, dispatch, main, parser
+from flights_tracker.cli import dispatch, main, parser
 from flights_tracker.provider import ProviderError, SkyscannerWebProvider, _context, _results
-from flights_tracker.service import _agents
-from flights_tracker.service import run_search, validate_request
+from flights_tracker.service import _agents, alt_price, alternative_sort_key, matches_time_filters, run_flexible_search, run_search, validate_request
 
 
 def future(days: int) -> str:
@@ -145,16 +144,125 @@ def test_missing_agent_reference_is_protocol_error() -> None:
 
 
 def test_alternative_price_units_are_decimal_and_strict() -> None:
-    assert _alt_price({"amount": "123", "unit": "UNIT_CENTI", "currencyCode": "PLN"})["amount"] == "1.23"
-    assert _alt_price({"amount": "123", "unit": "UNIT_WHOLE", "currencyCode": "PLN"})["amount"] == "123.00"
+    assert alt_price({"amount": "123", "unit": "UNIT_CENTI", "currencyCode": "PLN"})["amount"] == "1.23"
+    assert alt_price({"amount": "123", "unit": "UNIT_WHOLE", "currencyCode": "PLN"})["amount"] == "123.00"
     with pytest.raises(ProviderError):
-        _alt_price({"amount": "1", "unit": "UNKNOWN"})
+        alt_price({"amount": "1", "unit": "UNKNOWN"})
 
 
 def test_alternative_sort_does_not_lose_precision_for_huge_prices() -> None:
     values = [{"price": {"amount": "999999999999999999999999.02"}}, {"price": {"amount": "999999999999999999999999.01"}}]
-    values.sort(key=_alternative_sort_key)
+    values.sort(key=alternative_sort_key)
     assert values[0]["price"]["amount"].endswith(".01")
+
+
+def test_time_filters_match_outbound_and_return_clocks() -> None:
+    result = {
+        "legs": [
+            {"departure_local": "2026-09-25T06:10:00"},
+            {"departure_local": "2026-09-29T18:30:00"},
+        ]
+    }
+    assert matches_time_filters(result, {"depart_before": "12:00", "return_after": "17:00"})
+    assert not matches_time_filters(result, {"depart_before": "05:00"})
+    assert not matches_time_filters(result, {"return_after": "19:00"})
+
+
+def test_time_filter_validation_normalizes_hhmm() -> None:
+    req = request()
+    req["filters"] = {"direct_only": False, "depart_before": "9:05", "return_after": "17:00"}
+    validated = validate_request(req)
+    assert validated["filters"]["depart_before"] == "09:05"
+    assert validated["filters"]["return_after"] == "17:00"
+
+
+@pytest.mark.asyncio
+async def test_search_applies_depart_before_filter() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "autosuggest" in req.url.path:
+            query = req.url.path.rsplit("/", 1)[-1]
+            place = {"WAW": ("Warszawa", "11"), "POZ": ("Poznań", "22"), "Rzym": ("Rzym", "33")}[query]
+            return httpx.Response(200, json=[{"PlaceName": place[0], "IataCode": query if query != "Rzym" else "ROM", "GeoId": place[1], "GeoContainerId": place[1], "CountryId": "PL" if query != "Rzym" else "IT"}])
+        body = __import__("json").loads(req.content)
+        origin = body["legs"][0]["legOrigin"]["entityId"]
+        hour = 6 if origin == "11" else 18
+        result = {
+            "price": {"raw": 100 if origin == "11" else 80},
+            "legs": [
+                {"departure": f"2027-01-01T{hour:02d}:00:00", "arrival": f"2027-01-01T{hour+2:02d}:00:00", "durationInMinutes": 120, "stopCount": 0, "segments": []},
+                {"departure": "2027-01-08T18:00:00", "arrival": "2027-01-08T20:00:00", "durationInMinutes": 120, "stopCount": 0, "segments": []},
+            ],
+        }
+        return httpx.Response(200, json={"context": {"status": "complete", "sessionId": "not-logged"}, "itineraries": {"results": [result]}})
+
+    req = request()
+    req["filters"] = {"direct_only": False, "depart_before": "12:00"}
+    response = await run_search(req, transport=httpx.MockTransport(handler))
+    assert response["status"] == "complete"
+    assert len(response["results"]) == 1
+    assert response["results"][0]["origin"] == "WAW"
+    assert response["meta"]["time_filtered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flexible_search_uses_top_date_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_alt(req, **kwargs):
+        return {
+            "status": "complete",
+            "partial_failures": [],
+            "meta": {"polls": 1},
+            "_all_results": [
+                {
+                    "origin": "WAW",
+                    "origin_place": {"iata": "WAW"},
+                    "departure_date": future(40),
+                    "return_date": future(44),
+                    "nights": 4,
+                    "price": {"amount": "300.00", "currency": "PLN"},
+                    "direct_price": {"amount": "300.00", "currency": "PLN"},
+                },
+                {
+                    "origin": "GDN",
+                    "origin_place": {"iata": "GDN"},
+                    "departure_date": future(41),
+                    "return_date": future(45),
+                    "nights": 4,
+                    "price": {"amount": "310.00", "currency": "PLN"},
+                    "direct_price": {"amount": "310.00", "currency": "PLN"},
+                },
+            ],
+        }
+
+    async def fake_search(req, **kwargs):
+        origin = req["origins"][0]["iata"]
+        depart = req["trip"]["depart"]["date"]
+        return {
+            "status": "complete",
+            "warnings": [],
+            "partial_failures": [],
+            "results": [{
+                "id": f"{origin}-{depart}",
+                "origin": origin,
+                "destination": "ROM",
+                "price": {"amount": "350.00" if origin == "WAW" else "360.00", "currency": "PLN"},
+                "legs": [
+                    {"departure_local": f"{depart}T06:00:00", "duration_minutes": 120, "stops": 0, "segments": []},
+                    {"departure_local": f"{req['trip']['return']['date']}T18:00:00", "duration_minutes": 120, "stops": 0, "segments": []},
+                ],
+            }],
+        }
+
+    monkeypatch.setattr("flights_tracker.service.run_alternative_dates", fake_alt)
+    monkeypatch.setattr("flights_tracker.service.run_search", fake_search)
+    req = request()
+    req["date_candidates"] = 2
+    req["filters"] = {"direct_only": True}
+    response = await run_flexible_search(req)
+    assert response["status"] == "complete"
+    assert len(response["date_candidates"]) == 2
+    assert len(response["results"]) == 2
+    assert response["results"][0]["date_pair"]["origin"] == "WAW"
+    assert response["meta"]["searches"] == 2
 
 
 def test_deep_radar_contract_validation() -> None:
