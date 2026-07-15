@@ -80,16 +80,20 @@ Use `--request request.json` for an existing request file.
 
 ## Check alternative dates
 
-Use the same route, passenger, market, locale, and currency conventions as search:
+Use the same route, passenger, market, locale, and currency conventions as search. Pass `--origin` repeatedly to compare date grids across several departure points:
 
 ```bash
 flights alternative-dates \
-  --origin WAW --destination ROM \
-  --depart 2026-09-10 --return 2026-09-17 \
-  --adults 1 --market PL --locale pl-PL --currency PLN --json
+  --origin WAW --origin POZ --origin GDN \
+  --destination ROM \
+  --depart 2026-09-25 --return 2026-09-29 \
+  --adults 1 --market PL --locale pl-PL --currency PLN \
+  --direct --min-nights 3 --max-nights 5 --limit 30 --json
 ```
 
-Use alternative dates to identify promising date pairs, then run `flights search` for live itineraries and current prices. Do not present an alternative-date quote as a guaranteed bookable fare.
+Each result includes `origin`, `departure_date`, `return_date`, `nights`, `price`, and `direct_price`. With `--direct`, only pairs that have a direct quote are kept and sorting uses `direct_price`. Use `--min-nights` / `--max-nights` when the user wants a similar trip length rather than 1-night outliers from the provider grid.
+
+Use alternative dates first when the user asks for nearby/flexible dates. Pick promising pairs from the grid, then run `flights search` for live itineraries and current prices. Do not present an alternative-date quote as a guaranteed bookable fare. Do not fan out many manual `search` calls until `alternative-dates` has been tried (or returned a real provider failure).
 
 ## Process JSON
 

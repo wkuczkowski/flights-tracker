@@ -92,6 +92,71 @@ async def test_alternative_dates_inflight_request_obeys_deadline() -> None:
     assert time.monotonic() - started < .05
 
 
+def test_alt_session_status_does_not_treat_incomplete_as_complete() -> None:
+    from flights_tracker.provider import _alt_session_complete, _alt_session_incomplete
+
+    assert _alt_session_incomplete("POLLING_SESSION_STATUS_INCOMPLETE")
+    assert not _alt_session_complete("POLLING_SESSION_STATUS_INCOMPLETE")
+    assert _alt_session_complete("POLLING_SESSION_STATUS_COMPLETE")
+    assert not _alt_session_incomplete("POLLING_SESSION_STATUS_COMPLETE")
+
+
+@pytest.mark.asyncio
+async def test_alternative_dates_polls_until_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("flights_tracker.provider.asyncio.sleep", lambda _: _noop())
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        if calls == 1:
+            assert "pollingSessionId" not in body
+            return httpx.Response(
+                200,
+                json={
+                    "pollingSession": {
+                        "status": "POLLING_SESSION_STATUS_INCOMPLETE",
+                        "pollingSessionId": "alt-session",
+                    },
+                    "alternativeDates": [],
+                },
+            )
+        assert body.get("pollingSessionId") == "alt-session"
+        return httpx.Response(
+            200,
+            json={
+                "pollingSession": {"status": "POLLING_SESSION_STATUS_COMPLETE", "pollingSessionId": "alt-session"},
+                "alternativeDates": [
+                    {
+                        "departureDate": "2026-09-26",
+                        "returnDate": "2026-09-30",
+                        "availability": "AVAILABILITY_PRICE_AVAILABLE",
+                        "cheapestPrice": {"currencyCode": "PLN", "amount": "300", "unit": "UNIT_WHOLE"},
+                    }
+                ],
+            },
+        )
+
+    origin = {"GeoId": "1"}
+    destination = {"GeoId": "2"}
+    async with httpx.AsyncClient(base_url="https://www.skyscanner.pl", transport=httpx.MockTransport(handler)) as client:
+        dates, polls, complete = await SkyscannerWebProvider(client).alternative_dates(
+            origin,
+            destination,
+            depart=date(2026, 9, 25),
+            return_date=date(2026, 9, 29),
+            adults=1,
+            child_ages=[],
+            cabin="economy",
+            deadline=time.monotonic() + 10,
+        )
+    assert complete
+    assert polls == 1
+    assert calls == 2
+    assert dates[0]["departureDate"] == "2026-09-26"
+
+
 @pytest.mark.asyncio
 async def test_poll_empty_keeps_previous_and_nonempty_replaces_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("flights_tracker.provider.asyncio.sleep", lambda _: _noop())

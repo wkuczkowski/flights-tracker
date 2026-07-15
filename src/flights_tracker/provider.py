@@ -194,11 +194,11 @@ class SkyscannerWebProvider:
             polling = data.get("pollingSession", {})
             if not isinstance(polling, dict):
                 raise ProviderError("CONTRACT_CHANGED", "pollingSession must be an object")
-            status = polling.get("status") or data.get("pollingSessionStatus", "")
+            status = str(polling.get("status") or data.get("pollingSessionStatus", ""))
             session = polling.get("pollingSessionId") or data.get("pollingSessionId")
-            if status and not (str(status).endswith("COMPLETE") or str(status).endswith("INCOMPLETE")):
+            complete = _alt_session_complete(status)
+            if status and not (complete or _alt_session_incomplete(status)):
                 raise ProviderError("CONTRACT_CHANGED", f"Unknown alternative-dates status: {status!r}")
-            complete = str(status).endswith("COMPLETE")
             if complete or not session:
                 break
             body["pollingSessionId"] = session
@@ -223,6 +223,15 @@ def _radar_leg(origin: dict[str, Any], destination: dict[str, Any], day: date, p
 
 def _alt_leg(origin: dict[str, Any], destination: dict[str, Any], day: date) -> dict[str, Any]:
     return {"date": {"year": day.year, "month": day.month, "day": day.day}, "origin": [str(origin["GeoId"])], "destination": [str(destination["GeoId"])]}
+
+
+def _alt_session_incomplete(status: str) -> bool:
+    return status.endswith("INCOMPLETE")
+
+
+def _alt_session_complete(status: str) -> bool:
+    # INCOMPLETE also ends with COMPLETE; check the longer suffix first.
+    return status.endswith("COMPLETE") and not _alt_session_incomplete(status)
 
 
 def _context(data: Any) -> tuple[str, str | None]:

@@ -37,7 +37,7 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("search", help="Search live flights")
     _search_args(s); s.add_argument("--request", metavar="FILE", help="Read complete JSON request from FILE or -"); _json_flag(s)
     a = sub.add_parser("alternative-dates", help="Get nearby date/price combinations")
-    _search_args(a, single_origin=True); a.add_argument("--request", metavar="FILE", help="Read JSON request from FILE or -"); _json_flag(a)
+    _alt_dates_args(a); a.add_argument("--request", metavar="FILE", help="Read JSON request from FILE or -"); _json_flag(a)
     d = sub.add_parser("doctor", help="Probe endpoint access and contract without creating a flight search")
     _culture(d); _json_flag(d)
     b = sub.add_parser("browser", help="Manual browser challenge helpers")
@@ -64,6 +64,12 @@ def _search_args(p: argparse.ArgumentParser, single_origin: bool = False) -> Non
     p.add_argument("--limit", type=int, default=20); p.add_argument("--timeout", type=float, default=60.0); _culture(p)
 
 
+def _alt_dates_args(p: argparse.ArgumentParser) -> None:
+    _search_args(p)
+    p.add_argument("--min-nights", type=int, help="Keep round-trips with at least this many nights")
+    p.add_argument("--max-nights", type=int, help="Keep round-trips with at most this many nights")
+
+
 def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.request:
         try:
@@ -76,11 +82,18 @@ def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
         return data
     if not args.origin or not args.destination or not args.depart:
         raise FlightsError("INVALID_ARGUMENT", "--origin, --destination and --depart are required without --request")
-    return {"schema_version": "1.0", "origins": [{"iata": x.upper()} if len(x) == 3 and x.isalpha() else {"query": x} for x in args.origin],
+    data = {"schema_version": "1.0", "origins": [{"iata": x.upper()} if len(x) == 3 and x.isalpha() else {"query": x} for x in args.origin],
             "destination": {"iata": args.destination.upper()} if len(args.destination) == 3 and args.destination.isalpha() else {"query": args.destination},
             "trip": {"type": "round_trip" if args.return_date else "one_way", "depart": {"date": args.depart}, **({"return": {"date": args.return_date}} if args.return_date else {})},
             "passengers": {"adults": args.adults, "children_ages": args.child_age}, "cabin": args.cabin,
             "market": args.market, "locale": args.locale, "currency": args.currency, "filters": {"direct_only": args.direct, "max_stops": args.max_stops}, "sort": args.sort, "limit": args.limit}
+    if getattr(args, "min_nights", None) is not None or getattr(args, "max_nights", None) is not None:
+        data["stay"] = {}
+        if getattr(args, "min_nights", None) is not None:
+            data["stay"]["min_nights"] = args.min_nights
+        if getattr(args, "max_nights", None) is not None:
+            data["stay"]["max_nights"] = args.max_nights
+    return data
 
 
 async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
@@ -97,20 +110,102 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if timeout <= 0:
             raise FlightsError("INVALID_ARGUMENT", "timeout must be greater than zero")
         deadline = started + timeout
+        direct_only = bool((req.get("filters") or {}).get("direct_only"))
+        stay = req.get("stay") or {}
+        min_nights = stay.get("min_nights")
+        max_nights = stay.get("max_nights")
+        if min_nights is not None and (not isinstance(min_nights, int) or isinstance(min_nights, bool) or min_nights < 0):
+            raise FlightsError("INVALID_ARGUMENT", "stay.min_nights must be a non-negative integer")
+        if max_nights is not None and (not isinstance(max_nights, int) or isinstance(max_nights, bool) or max_nights < 0):
+            raise FlightsError("INVALID_ARGUMENT", "stay.max_nights must be a non-negative integer")
+        if min_nights is not None and max_nights is not None and min_nights > max_nights:
+            raise FlightsError("INVALID_ARGUMENT", "stay.min_nights cannot exceed stay.max_nights")
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(25, connect=5), follow_redirects=False) as client:
             provider = SkyscannerWebProvider(client, culture=culture)
-            if len(req["origins"]) != 1:
-                raise FlightsError("INVALID_ARGUMENT", "alternative-dates requires exactly one origin")
             try:
-                origin = await asyncio.wait_for(provider.resolve_place(req["origins"][0].get("iata") or req["origins"][0].get("query")), max(.001, deadline-time.monotonic()))
                 destination = await asyncio.wait_for(provider.resolve_place(req["destination"].get("iata") or req["destination"].get("query"), destination=True), max(.001, deadline-time.monotonic()))
+                origins = await asyncio.wait_for(
+                    asyncio.gather(*(provider.resolve_place(o.get("iata") or o.get("query")) for o in req["origins"])),
+                    max(.001, deadline - time.monotonic()),
+                )
             except TimeoutError as exc:
                 raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving places", retryable=True) from exc
             passengers = req["passengers"]
-            dates, polls, complete = await provider.alternative_dates(origin, destination, depart=req["_depart"], return_date=req["_return"], adults=passengers.get("adults", 1), child_ages=passengers.get("children_ages", []), cabin=req.get("cabin", "economy"), deadline=deadline)
-        normalized = [{"departure_date": x.get("departureDate"), "return_date": x.get("returnDate"), "availability": x.get("availability"), "price": _alt_price(x.get("cheapestPrice")), "direct_availability": x.get("directAvailability"), "direct_price": _alt_price(x.get("cheapestDirectPrice"))} for x in dates]
-        normalized.sort(key=_alternative_sort_key)
-        return {"schema_version": "1.0", "request_id": request_id(), "status": "complete" if complete else "partial", "provider": "skyscanner_web", "origin": place_summary(origin), "destination": place_summary(destination), "results": normalized[:req.get("limit", 20)], "meta": {"result_count": len(normalized), "polls": polls}}
+            semaphore = asyncio.Semaphore(2)
+
+            async def one(origin: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], int, bool]:
+                async with semaphore:
+                    dates, polls, complete = await provider.alternative_dates(
+                        origin,
+                        destination,
+                        depart=req["_depart"],
+                        return_date=req["_return"],
+                        adults=passengers.get("adults", 1),
+                        child_ages=passengers.get("children_ages", []),
+                        cabin=req.get("cabin", "economy"),
+                        deadline=deadline,
+                    )
+                    return origin, dates, polls, complete
+
+            outcomes = await asyncio.gather(*(one(origin) for origin in origins), return_exceptions=True)
+
+        normalized: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        polls = 0
+        incomplete = False
+        for original, outcome in zip(req["origins"], outcomes, strict=True):
+            label = original.get("iata") or original.get("query")
+            if isinstance(outcome, Exception):
+                if isinstance(outcome, FlightsError):
+                    failures.append({"origin": label, "code": outcome.code, "retryable": outcome.retryable})
+                    continue
+                raise outcome
+            origin, dates, count, complete = outcome
+            polls += count
+            incomplete |= not complete
+            origin_label = origin.get("IataCode") or origin.get("PlaceName") or label
+            for item in dates:
+                row = {
+                    "origin": origin_label,
+                    "departure_date": item.get("departureDate"),
+                    "return_date": item.get("returnDate"),
+                    "availability": item.get("availability"),
+                    "price": _alt_price(item.get("cheapestPrice")),
+                    "direct_availability": item.get("directAvailability"),
+                    "direct_price": _alt_price(item.get("cheapestDirectPrice")),
+                }
+                nights = _trip_nights(row.get("departure_date"), row.get("return_date"))
+                if nights is not None:
+                    row["nights"] = nights
+                if direct_only and not row["direct_price"]:
+                    continue
+                if min_nights is not None and (nights is None or nights < min_nights):
+                    continue
+                if max_nights is not None and (nights is None or nights > max_nights):
+                    continue
+                normalized.append(row)
+        normalized.sort(key=lambda item: _alternative_sort_key(item, direct_only=direct_only))
+        limit = req.get("limit", 20)
+        status = "complete" if not incomplete and not failures else ("partial" if normalized else "failed")
+        if status == "failed" and failures:
+            raise FlightsError(failures[0]["code"], f"Alternative-dates failed for all origins ({failures[0]['code']})", retryable=bool(failures[0].get("retryable")), details={"partial_failures": failures})
+        return {
+            "schema_version": "1.0",
+            "request_id": request_id(),
+            "status": status,
+            "provider": "skyscanner_web",
+            "origins": [place_summary(o) for o in origins],
+            "destination": place_summary(destination),
+            "results": normalized[:limit],
+            "partial_failures": failures,
+            "meta": {
+                "result_count": len(normalized),
+                "polls": polls,
+                "direct_only": direct_only,
+                "min_nights": min_nights,
+                "max_nights": max_nights,
+            },
+        }
     if args.command == "doctor":
         started = time.monotonic()
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(15, connect=5), follow_redirects=False) as client:
@@ -138,6 +233,15 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     raise FlightsError("INVALID_ARGUMENT", "Unknown command")
 
 
+def _trip_nights(depart: Any, ret: Any) -> int | None:
+    if not isinstance(depart, str) or not isinstance(ret, str):
+        return None
+    try:
+        return (parse_date(ret, "return") - parse_date(depart, "depart")).days
+    except FlightsError:
+        return None
+
+
 def _alt_price(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict) or value.get("amount") is None:
         return None
@@ -154,8 +258,12 @@ def _alt_price(value: Any) -> dict[str, str] | None:
     return {"amount": amount, "currency": value.get("currencyCode")}
 
 
-def _alternative_sort_key(item: dict[str, Any]) -> tuple[Decimal, str]:
-    return Decimal((item.get("price") or {}).get("amount", "Infinity")), item.get("departure_date") or ""
+def _alternative_sort_key(item: dict[str, Any], *, direct_only: bool = False) -> tuple[Decimal, str, str]:
+    price = item.get("direct_price") if direct_only else item.get("price")
+    if direct_only and not price:
+        price = item.get("price")
+    amount = Decimal((price or {}).get("amount", "Infinity"))
+    return amount, item.get("departure_date") or "", str(item.get("origin") or "")
 
 
 def failure(exc: FlightsError) -> dict[str, Any]:
