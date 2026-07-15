@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flights Tracker CLI"
+  short_description: "Search and compare flights from the terminal"
+  default_prompt: "Use $flights-tracker-cli to find and compare flights with structured JSON output."

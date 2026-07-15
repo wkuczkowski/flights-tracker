@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Local playwright-cli state
+.playwright-cli/
+
+# Pytest / coverage / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+.coverage
+htmlcov/
+*.log
+
+# Captures / local dumps
+*.har
+*.sqlite
+*.db
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
