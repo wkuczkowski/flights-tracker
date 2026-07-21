@@ -214,6 +214,436 @@ def _origin_request_place(resolved: dict[str, Any], original: dict[str, Any]) ->
     return {"query": str(original.get("query") or resolved.get("PlaceName") or iata or "")}
 
 
+def _explore_date(value: Any, field: str) -> tuple[dict[str, str], date | None]:
+    if not isinstance(value, dict):
+        raise FlightsError("INVALID_ARGUMENT", f"{field} must be an object")
+    scope = value.get("scope")
+    if scope == "exact":
+        if set(value) - {"scope", "date"}:
+            raise FlightsError("INVALID_ARGUMENT", f"{field} exact scope accepts only date")
+        parsed = parse_date(value.get("date"), field)
+        return {
+            "@type": "date", "year": f"{parsed.year:04d}", "month": f"{parsed.month:02d}", "day": f"{parsed.day:02d}"
+        }, parsed
+    if scope == "month":
+        if set(value) - {"scope", "month"} or not isinstance(value.get("month"), str):
+            raise FlightsError("INVALID_ARGUMENT", f"{field} month scope requires month")
+        try:
+            parsed = date.fromisoformat(f"{value['month']}-01")
+        except ValueError:
+            raise FlightsError("INVALID_ARGUMENT", f"{field}.month must be YYYY-MM") from None
+        if parsed.replace(day=1) < date.today().replace(day=1):
+            raise FlightsError("INVALID_ARGUMENT", f"{field}.month is in the past")
+        return {"@type": "month", "year": f"{parsed.year:04d}", "month": f"{parsed.month:02d}"}, None
+    if scope == "anytime":
+        if set(value) != {"scope"}:
+            raise FlightsError("INVALID_ARGUMENT", f"{field} anytime scope accepts no date value")
+        return {"@type": "anytime"}, None
+    raise FlightsError("INVALID_ARGUMENT", f"{field}.scope must be exact, month or anytime")
+
+
+def validate_explore_request(req: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(req, dict):
+        raise FlightsError("INVALID_ARGUMENT", "JSON request must be an object")
+    req = copy.deepcopy(req)
+    if req.get("schema_version", "1.0") != "1.0":
+        raise FlightsError("INVALID_ARGUMENT", "schema_version must be '1.0'")
+    origins = req.get("origins")
+    if not isinstance(origins, list) or not 1 <= len(origins) <= 6:
+        raise FlightsError("INVALID_ARGUMENT", "origins must contain 1 to 6 places")
+    for place in origins:
+        _validate_place(place, "origin")
+    scope = req.get("destination_scope")
+    if not isinstance(scope, dict) or scope.get("level") not in {"country", "city"}:
+        raise FlightsError("INVALID_ARGUMENT", "destination_scope.level must be country or city")
+    countries = scope.get("countries")
+    if scope["level"] == "country":
+        if scope.get("anywhere") is not True or countries:
+            raise FlightsError("INVALID_ARGUMENT", "country exploration requires anywhere true and no countries")
+    else:
+        if scope.get("anywhere") is not False or not isinstance(countries, list) or not 1 <= len(countries) <= 20:
+            raise FlightsError("INVALID_ARGUMENT", "city exploration requires anywhere false and 1 to 20 countries")
+        for country in countries:
+            if not isinstance(country, dict) or bool(country.get("code")) == bool(country.get("query")):
+                raise FlightsError("INVALID_ARGUMENT", "country requires exactly one of code or query")
+            if country.get("code"):
+                code = str(country["code"]).upper()
+                if not re.fullmatch(r"[A-Z]{2}", code):
+                    raise FlightsError("INVALID_ARGUMENT", "country.code must be a two-letter uppercase code")
+                country["code"] = code
+            elif not isinstance(country.get("query"), str) or not country["query"].strip():
+                raise FlightsError("INVALID_ARGUMENT", "country.query must be non-empty text")
+    trip = req.get("trip")
+    if not isinstance(trip, dict) or trip.get("type") not in {"one_way", "round_trip"}:
+        raise FlightsError("INVALID_ARGUMENT", "trip.type is required and must be one_way or round_trip")
+    depart, depart_exact = _explore_date(trip.get("depart"), "trip.depart")
+    return_value = trip.get("return")
+    if trip["type"] == "one_way" and return_value is not None:
+        raise FlightsError("INVALID_ARGUMENT", "one_way must not include trip.return")
+    if trip["type"] == "round_trip" and return_value is None:
+        raise FlightsError("INVALID_ARGUMENT", "round_trip requires trip.return")
+    returned, return_exact = _explore_date(return_value, "trip.return") if return_value is not None else (None, None)
+    if depart_exact and return_exact and return_exact < depart_exact:
+        raise FlightsError("INVALID_ARGUMENT", "return must not be before depart")
+    req["_depart"], req["_return"] = depart, returned
+    req["_depart_exact"], req["_return_exact"] = depart_exact, return_exact
+    passengers = req.setdefault("passengers", {"adults": 1, "children_ages": []})
+    if not isinstance(passengers, dict):
+        raise FlightsError("INVALID_ARGUMENT", "passengers must be an object")
+    adults, children = passengers.get("adults", 1), passengers.get("children_ages", [])
+    if (not isinstance(adults, int) or isinstance(adults, bool) or not 1 <= adults <= 8 or
+            not isinstance(children, list) or any(not isinstance(age, int) or isinstance(age, bool) or not 0 <= age <= 17 for age in children) or
+            adults + len(children) > 9):
+        raise FlightsError("INVALID_ARGUMENT", "passengers must be 1-9 people with valid child ages")
+    if req.get("cabin", "economy") not in {"economy", "premium_economy", "business", "first"}:
+        raise FlightsError("INVALID_ARGUMENT", "unsupported cabin")
+    limit = req.get("limit", 50)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise FlightsError("INVALID_ARGUMENT", "limit must be from 1 to 200")
+    req["limit"] = limit
+    if req.get("sort", "price") != "price":
+        raise FlightsError("INVALID_ARGUMENT", "explore sort must be price")
+    for field, pattern, message in (
+        ("market", r"[A-Z]{2}", "market must be a two-letter uppercase code"),
+        ("locale", r"[a-z]{2,3}(?:-[A-Z]{2})?", "locale must resemble a BCP-47 language tag"),
+        ("currency", r"[A-Z]{3}", "currency must be an uppercase ISO-4217 code"),
+    ):
+        default = {"market": "PL", "locale": "pl-PL", "currency": "PLN"}[field]
+        if not re.fullmatch(pattern, str(req.get(field, default))):
+            raise FlightsError("INVALID_ARGUMENT", message)
+    filters = req.setdefault("filters", {})
+    if not isinstance(filters, dict) or not isinstance(filters.get("direct_only", False), bool):
+        raise FlightsError("INVALID_ARGUMENT", "filters.direct_only must be boolean")
+    for name in ("include_continents", "exclude_continents"):
+        values = filters.get(name, [])
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+            raise FlightsError("INVALID_ARGUMENT", f"filters.{name} must be a list of continent codes or names")
+    for name in ("include_destinations", "exclude_destinations"):
+        values = filters.get(name, [])
+        if not isinstance(values, list):
+            raise FlightsError("INVALID_ARGUMENT", f"filters.{name} must be a list of public destination references")
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                continue
+            if isinstance(value, dict):
+                present = [key for key in ("code", "query", "name") if value.get(key)]
+                if len(present) == 1 and isinstance(value[present[0]], str):
+                    continue
+            raise FlightsError("INVALID_ARGUMENT", f"filters.{name} contains an invalid public destination reference")
+    maximum = filters.get("max_price")
+    if maximum is not None:
+        if not isinstance(maximum, dict) or maximum.get("currency") != req.get("currency", "PLN"):
+            raise FlightsError("INVALID_ARGUMENT", "filters.max_price must use the request currency")
+        try:
+            amount = Decimal(str(maximum.get("amount")))
+        except (InvalidOperation, ValueError):
+            raise FlightsError("INVALID_ARGUMENT", "filters.max_price.amount must be a decimal") from None
+        if amount < 0:
+            raise FlightsError("INVALID_ARGUMENT", "filters.max_price.amount must be non-negative")
+        maximum["amount"] = format(amount.quantize(Decimal("0.01")), "f")
+    stay = req.get("stay")
+    if stay is not None:
+        if not isinstance(stay, dict):
+            raise FlightsError("INVALID_ARGUMENT", "stay must be an object")
+        for key in ("min_nights", "max_nights"):
+            if key in stay and (not isinstance(stay[key], int) or isinstance(stay[key], bool) or stay[key] < 0):
+                raise FlightsError("INVALID_ARGUMENT", f"stay.{key} must be a non-negative integer")
+        if stay.get("min_nights") is not None and stay.get("max_nights") is not None and stay["min_nights"] > stay["max_nights"]:
+            raise FlightsError("INVALID_ARGUMENT", "stay.min_nights cannot exceed stay.max_nights")
+    if "timeout" in req and (not isinstance(req["timeout"], (int, float)) or isinstance(req["timeout"], bool) or req["timeout"] <= 0):
+        raise FlightsError("INVALID_ARGUMENT", "timeout must be greater than zero")
+    return req
+
+
+def _public_label(original: dict[str, Any], resolved: dict[str, Any] | None = None) -> str:
+    return str(original.get("iata") or original.get("query") or (resolved or {}).get("IataCode") or (resolved or {}).get("PlaceName"))
+
+
+def _public_country(original: dict[str, Any], resolved: dict[str, Any]) -> dict[str, str]:
+    return {
+        "code": str(original.get("code") or resolved.get("CountryId") or "").upper(),
+        "name": str(resolved.get("CountryName") or resolved.get("PlaceName") or original.get("query") or original.get("code")),
+    }
+
+
+def _indicative_price(value: Any, currency: str) -> dict[str, str] | None:
+    if not isinstance(value, dict) or value.get("rawPrice") is None:
+        return None
+    return {"amount": decimal_string(value["rawPrice"]), "currency": currency}
+
+
+def _stay_annotation(req: dict[str, Any]) -> tuple[int | None, bool | str]:
+    depart, returned = req.get("_depart_exact"), req.get("_return_exact")
+    if not depart or not returned:
+        return None, "unknown"
+    nights = (returned - depart).days
+    stay = req.get("stay") or {}
+    minimum, maximum = stay.get("min_nights"), stay.get("max_nights")
+    matches = (minimum is None or nights >= minimum) and (maximum is None or nights <= maximum)
+    return nights, matches
+
+
+def _reference_tokens(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {_fold_public(value)}
+    if isinstance(value, dict):
+        return {_fold_public(str(item)) for key in ("code", "query", "name") if (item := value.get(key))}
+    return set()
+
+
+def _fold_public(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _continent_token(value: Any) -> str:
+    token = _fold_public(str(value or ""))
+    aliases = {
+        "eu": "eu", "europe": "eu", "europa": "eu",
+        "af": "af", "africa": "af", "afryka": "af",
+        "as": "as", "asia": "as", "azja": "as",
+        "na": "na", "north america": "na", "ameryka polnocna": "na", "ameryka północna": "na",
+        "sa": "sa", "south america": "sa", "ameryka poludniowa": "sa", "ameryka południowa": "sa",
+        "oc": "oc", "oceania": "oc", "oceania i pacyfik": "oc",
+        "an": "an", "antarctica": "an", "antarktyda": "an",
+    }
+    return aliases.get(token, token)
+
+
+def _matches_references(destination: dict[str, Any], references: list[Any]) -> bool:
+    available = {_fold_public(str(destination.get("code", ""))), _fold_public(str(destination.get("name", "")))}
+    return any(available & _reference_tokens(reference) for reference in references)
+
+
+async def run_explore(
+    req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    req = validate_explore_request(req)
+    deadline = started + float(req.get("timeout", timeout))
+    culture = Culture(req.get("market", "PL"), req.get("locale", "pl-PL"), req.get("currency", "PLN"))
+    level = req["destination_scope"]["level"]
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(25, connect=5), follow_redirects=False, transport=transport) as client:
+        provider = SkyscannerWebProvider(client, culture=culture)
+        resolve_semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
+
+        async def resolve_origin(value: dict[str, Any]) -> dict[str, Any] | FlightsError:
+            try:
+                async with resolve_semaphore:
+                    return await provider.resolve_place(value.get("query") or value.get("iata"), destination=False)
+            except FlightsError as exc:
+                return exc
+
+        try:
+            origins = await asyncio.wait_for(
+                asyncio.gather(*(resolve_origin(value) for value in req["origins"])),
+                max(0.001, deadline - time.monotonic()),
+            )
+            resolution_challenge = next(
+                (value for value in origins if isinstance(value, FlightsError) and value.code == "BOT_CHALLENGE"), None
+            )
+            if resolution_challenge:
+                raise resolution_challenge
+            country_inputs = req["destination_scope"].get("countries", []) if level == "city" else [None]
+            countries = []
+            for value in country_inputs:
+                if value is None:
+                    countries.append(None)
+                else:
+                    countries.append(await asyncio.wait_for(
+                        provider.resolve_place(value.get("code") or value.get("query"), destination=True),
+                        max(0.001, deadline - time.monotonic()),
+                    ))
+        except TimeoutError as exc:
+            raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving Explore places", retryable=True) from exc
+
+        semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
+        bot_event = asyncio.Event()
+        passengers = req["passengers"]
+
+        async def one(country_index: int, origin_index: int, origin: dict[str, Any], country: dict[str, Any] | None) -> tuple[Any, ...] | FlightsError:
+            async with semaphore:
+                if bot_event.is_set():
+                    return ProviderError("BOT_CHALLENGE", "Skyscanner blocked this network session")
+                try:
+                    rows, tags, total, polls, complete = await provider.explore_one(
+                        origin, country, depart=req["_depart"], return_date=req["_return"],
+                        adults=passengers.get("adults", 1), child_ages=passengers.get("children_ages", []),
+                        cabin=req.get("cabin", "economy"), deadline=deadline,
+                    )
+                    return country_index, origin_index, rows, tags, total, polls, complete
+                except FlightsError as exc:
+                    if exc.code == "BOT_CHALLENGE":
+                        bot_event.set()
+                    return exc
+
+        outcomes: dict[tuple[int, int], Any] = {}
+        for origin_index, origin in enumerate(origins):
+            if isinstance(origin, FlightsError):
+                for country_index in range(len(countries)):
+                    outcomes[(country_index, origin_index)] = origin
+
+        async def indexed(country_index: int, origin_index: int, origin: dict[str, Any], country: dict[str, Any] | None) -> tuple[tuple[int, int], Any]:
+            return (country_index, origin_index), await one(country_index, origin_index, origin, country)
+
+        tasks = [
+            asyncio.create_task(indexed(ci, oi, origin, country))
+            for ci, country in enumerate(countries)
+            for oi, origin in enumerate(origins)
+            if isinstance(origin, dict)
+        ]
+        try:
+            async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+                for completed in asyncio.as_completed(tasks):
+                    key, outcome = await completed
+                    outcomes[key] = outcome
+                    if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        raise outcome
+        except TimeoutError as exc:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise ProviderError("PROVIDER_TIMEOUT", "Explore deadline reached", retryable=True) from exc
+
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    seen_by_task: dict[tuple[int, int], set[tuple[int, str]]] = {}
+    failures: list[dict[str, Any]] = []
+    incomplete = False
+    polls = 0
+    provider_candidates = 0
+    for (country_index, origin_index), outcome in outcomes.items():
+        original = req["origins"][origin_index]
+        if isinstance(outcome, FlightsError):
+            failure = {"origin": _public_label(original), "code": outcome.code, "retryable": outcome.retryable}
+            if level == "city":
+                failure["country"] = _public_country(country_inputs[country_index], countries[country_index])
+            failures.append(failure)
+            continue
+        _, _, rows, tags, total, count, complete = outcome
+        provider_candidates += total
+        polls += count
+        incomplete |= not complete
+        seen_by_task[(country_index, origin_index)] = set()
+        for raw in rows:
+            content = raw["content"]
+            location = content["location"]
+            code = str(location["skyCode"]).upper()
+            key = (country_index if level == "city" else 0, code)
+            if level == "country":
+                destination = {
+                    "level": "country", "code": code, "name": location["name"],
+                    "continent": location.get("continent"),
+                }
+            else:
+                destination = {
+                    "level": "city", "code": code, "name": location["name"],
+                    "country": _public_country(country_inputs[country_index], countries[country_index]),
+                    "continent": location.get("continent"),
+                }
+            group = grouped.setdefault(key, {"destination": destination, "provider_tags": set(), "options": {}})
+            group["provider_tags"].update(tags.get(raw["id"], []))
+            quotes = content.get("flightQuotes") or {}
+            cheapest = _indicative_price(quotes.get("cheapest"), culture.currency)
+            direct = _indicative_price(quotes.get("direct"), culture.currency)
+            if cheapest is None and direct is None:
+                continue
+            nights, stay_match = _stay_annotation(req)
+            option: dict[str, Any] = {
+                "origin": _public_label(original, origins[origin_index]), "state": "quoted",
+                "cheapest_price": cheapest, "cheapest_direct_price": direct,
+                "direct_flights_available": bool((content.get("flightRoutes") or {}).get("directFlightsAvailable")),
+                "outbound_date": req["_depart_exact"].isoformat() if req.get("_depart_exact") else None,
+                "return_date": req["_return_exact"].isoformat() if req.get("_return_exact") else None,
+                "nights": nights, "stay_match": stay_match, "observed_at": None,
+            }
+            group["options"][origin_index] = option
+            seen_by_task[(country_index, origin_index)].add(key)
+
+    results: list[dict[str, Any]] = []
+    direct_only = bool(req["filters"].get("direct_only"))
+    for key, group in grouped.items():
+        country_index = key[0] if level == "city" else 0
+        options = []
+        for origin_index, original in enumerate(req["origins"]):
+            outcome = outcomes[(country_index, origin_index)]
+            quoted = group["options"].get(origin_index)
+            if quoted:
+                options.append(quoted)
+            elif isinstance(outcome, FlightsError):
+                options.append({
+                    "origin": _public_label(original), "state": "failed",
+                    "error": {"code": outcome.code, "retryable": outcome.retryable},
+                })
+            else:
+                options.append({"origin": _public_label(original, origins[origin_index]), "state": "no_quote"})
+        quoted_options = [option for option in options if option["state"] == "quoted"]
+        overall = [option["cheapest_price"] for option in quoted_options if option.get("cheapest_price")]
+        directs = [option["cheapest_direct_price"] for option in quoted_options if option.get("cheapest_direct_price")]
+        best = min(overall, key=lambda price: Decimal(price["amount"])) if overall else None
+        best_direct = min(directs, key=lambda price: Decimal(price["amount"])) if directs else None
+        if direct_only and best_direct is None:
+            continue
+        row = {
+            "destination": group["destination"], "best_price": best, "best_direct_price": best_direct,
+            "provider_tags": sorted(group["provider_tags"]), "origin_options": options,
+        }
+        filters = req["filters"]
+        continent = row["destination"].get("continent") or {}
+        continent_tokens = {_continent_token(continent.get("code")), _continent_token(continent.get("name"))}
+        included_continents = {_continent_token(value) for value in filters.get("include_continents", [])}
+        excluded_continents = {_continent_token(value) for value in filters.get("exclude_continents", [])}
+        if included_continents and not continent_tokens & included_continents:
+            continue
+        if continent_tokens & excluded_continents:
+            continue
+        if filters.get("include_destinations") and not _matches_references(row["destination"], filters["include_destinations"]):
+            continue
+        if filters.get("exclude_destinations") and _matches_references(row["destination"], filters["exclude_destinations"]):
+            continue
+        ranking_price = best_direct if direct_only else best
+        maximum = filters.get("max_price")
+        if ranking_price is None or (maximum and Decimal(ranking_price["amount"]) > Decimal(maximum["amount"])):
+            continue
+        results.append(row)
+    results.sort(key=lambda row: (
+        Decimal((row["best_direct_price"] if direct_only else row["best_price"])["amount"]),
+        str(row["destination"].get("code") or ""), str(row["destination"].get("name") or ""),
+    ))
+    total_candidates = len(results)
+    results = results[:req["limit"]]
+    successful_tasks = len(outcomes) - sum(isinstance(value, FlightsError) for value in outcomes.values())
+    status = "failed" if not successful_tasks else ("partial" if failures or incomplete else "complete")
+    warnings = ["Indicative prices have no authoritative observation timestamp; observed_at is null"]
+    if any(value.get("scope") == "anytime" for value in (req["trip"].get("depart"), req["trip"].get("return")) if isinstance(value, dict)):
+        warnings.append("Anytime exploration does not guarantee stay length; stay_match is unknown")
+    if incomplete:
+        warnings.append("Explore polling deadline reached; results use the latest available snapshot")
+    response: dict[str, Any] = {
+        "schema_version": "1.0", "request_id": request_id(), "status": status,
+        "provider": "skyscanner_web", "price_kind": "indicative", "currency": culture.currency,
+        "searched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "query": {"origins": [_public_label(value) for value in req["origins"]], "destination_scope": req["destination_scope"], "trip": req["trip"]},
+        "results": results, "partial_failures": failures, "warnings": warnings,
+        "meta": {
+            "total_candidates": total_candidates, "returned_candidates": len(results),
+            "truncated": total_candidates > len(results), "provider_candidates": provider_candidates,
+            "polls": polls, "elapsed_ms": round((time.monotonic() - started) * 1000),
+        },
+    }
+    if status == "failed":
+        response["error"] = {
+            "code": failures[0]["code"] if failures else "PROVIDER_UNAVAILABLE",
+            "message": "Explore failed for all origin searches",
+            "retryable": any(value.get("retryable") for value in failures), "details": {},
+        }
+    return response
+
+
 async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
                      transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
     started = time.monotonic()
@@ -624,13 +1054,14 @@ def normalize_result(raw: dict[str, Any], origin: dict[str, Any], destination: d
     price = raw.get("price", {})
     legs = [_normalize_leg(x) for x in raw.get("legs", []) if isinstance(x, dict)]
     amount = decimal_string(price.get("raw", price.get("amount")))
+    booking_options = _booking_options(raw, currency)
     agents = _agents(raw, currency)
     stable = {"origin": origin.get("IataCode") or origin.get("GeoId"), "destination": destination.get("IataCode") or destination.get("GeoId"), "price": amount,
               "legs": [[l.get("departure_local"), l.get("arrival_local"), [(s.get("flight_number"), s.get("origin"), s.get("destination"), s["carrier"].get("iata"), s["carrier"].get("name")) for s in l["segments"]]] for l in legs],
-              "agents": [(a.get("name"), a["price"]["amount"]) for a in agents]}
+              "agents": [(agent.get("name"), agent["price"]["amount"]) for agent in agents]}
     result = {"id": hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:24], "origin": origin.get("IataCode") or origin.get("PlaceName"),
               "destination": destination.get("IataCode") or destination.get("PlaceName"), "price": {"amount": amount, "currency": currency}, "legs": legs,
-              "agents": agents, "is_self_transfer": bool(raw.get("isSelfTransfer", False)),
+              "booking_options": booking_options, "agents": agents, "is_self_transfer": bool(raw.get("isSelfTransfer", False)),
               "sustainability": {"is_eco_contender": bool(raw.get("eco")), "eco_contender_delta_percent": (raw.get("eco") or {}).get("ecoContenderDelta")}}
     return result
 
@@ -671,30 +1102,69 @@ def _place_code(value: Any) -> str | None:
 
 
 def _agents(raw: dict[str, Any], currency: str) -> list[dict[str, Any]]:
+    """Deprecated complete-trip agents; multi-booking components are deliberately absent."""
     output = []
-    lookup = raw.get("_agent_lookup", {})
-    for option in raw.get("pricingOptions", []) or []:
-        if not isinstance(option, dict):
+    for option in _booking_options(raw, currency):
+        if option["requires_multiple_bookings"] or len(option["booking_items"]) != 1:
             continue
-        items = option.get("items") or option.get("pricingItems") or [{}]
-        if not isinstance(items, list):
-            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing items must be a list")
-        for item in items:
+        item = option["booking_items"][0]
+        output.append({
+            "name": item.get("agent_name"),
+            "price": option["total_price"],
+            "deeplink": item.get("deeplink"),
+        })
+    return output
+
+
+def _booking_options(raw: dict[str, Any], currency: str) -> list[dict[str, Any]]:
+    options = raw.get("pricingOptions", []) or []
+    if not isinstance(options, list):
+        raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing options must be a list")
+    lookup = raw.get("_agent_lookup", {})
+    output = []
+    for option in options:
+        if not isinstance(option, dict):
+            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing option must be an object")
+        items = option.get("items") or option.get("pricingItems") or []
+        if not isinstance(items, list) or not items:
+            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing option must contain booking items")
+        normalized_items = []
+        agent_ids = option.get("agentIds") or []
+        if not isinstance(agent_ids, list):
+            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing option agentIds must be a list")
+        for index, item in enumerate(items):
             if not isinstance(item, dict):
                 raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing item must be an object")
             agent = option.get("agent") or {}
-            agent_ids = option.get("agentIds") or []
-            agent_id = item.get("agentId") or (agent_ids[0] if agent_ids else None)
+            agent_id = item.get("agentId") or (agent_ids[index] if index < len(agent_ids) else (agent_ids[0] if agent_ids else None))
+            if not isinstance(agent, dict):
+                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing option agent must be an object")
             if not agent and agent_id is not None and isinstance(lookup, dict):
                 agent = lookup.get(str(agent_id), {})
                 if not agent:
                     raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing item references a missing agent")
-            price = item.get("price") or option.get("price") or raw.get("price") or {}
-            try:
-                amount = decimal_string(price.get("raw", price.get("amount")))
-            except ProviderError:
-                continue
-            output.append({"name": agent.get("name") or option.get("agentName"), "price": {"amount": amount, "currency": currency}, "deeplink": item.get("deepLink") or item.get("deeplink")})
+            item_price = item.get("price")
+            if not isinstance(item_price, dict):
+                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing item has no component price")
+            normalized_items.append({
+                "agent_name": agent.get("name") or option.get("agentName"),
+                "price": {"amount": decimal_string(item_price.get("raw", item_price.get("amount"))), "currency": currency},
+                "deeplink": item.get("deepLink") or item.get("deeplink"),
+            })
+        total = option.get("price")
+        if not isinstance(total, dict):
+            if len(normalized_items) == 1:
+                total_price = normalized_items[0]["price"]
+            else:
+                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Multi-booking pricing option has no authoritative total")
+        else:
+            total_price = {"amount": decimal_string(total.get("raw", total.get("amount"))), "currency": currency}
+        output.append({
+            "total_price": total_price,
+            "requires_multiple_bookings": len(normalized_items) > 1,
+            "transfer_type": option.get("transferType"),
+            "booking_items": normalized_items,
+        })
     return output
 
 

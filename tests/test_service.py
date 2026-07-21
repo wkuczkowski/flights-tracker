@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -8,7 +10,7 @@ import pytest
 from flights_tracker.errors import FlightsError
 from flights_tracker.cli import dispatch, main, parser
 from flights_tracker.provider import ProviderError, SkyscannerWebProvider, _context, _results
-from flights_tracker.service import _agents, alt_price, alternative_sort_key, matches_time_filters, run_flexible_search, run_search, validate_request
+from flights_tracker.service import _agents, _booking_options, alt_price, alternative_sort_key, matches_time_filters, normalize_result, run_flexible_search, run_search, validate_request
 
 
 def future(days: int) -> str:
@@ -132,10 +134,25 @@ def test_one_way_rejects_return() -> None:
     assert caught.value.code == "INVALID_ARGUMENT"
 
 
-def test_agents_dict_and_all_pricing_items() -> None:
-    data = {"itineraries": {"agents": {"a": {"name": "Agent A"}, "b": {"name": "Agent B"}}, "results": [{"price": {"raw": 10}, "legs": [], "pricingOptions": [{"items": [{"agentId": "a", "price": {"raw": 10}}, {"agentId": "b", "price": {"raw": 12}}]}]}]}}
+def test_multi_item_booking_option_uses_authoritative_total_and_not_component_agents() -> None:
+    data = json.loads((Path(__file__).parent / "fixtures" / "live_pricing_options.json").read_text())
     raw = _results(data)[0]
-    assert [a["name"] for a in _agents(raw, "PLN")] == ["Agent A", "Agent B"]
+    assert _agents(raw, "PLN") == []
+    options = _booking_options(raw, "PLN")
+    assert options[0]["total_price"]["amount"] == "22.00"
+    assert options[0]["requires_multiple_bookings"] is True
+    assert options[0]["transfer_type"] == "SELF_TRANSFER"
+    assert [item["price"]["amount"] for item in options[0]["booking_items"]] == ["10.00", "12.00"]
+
+
+def test_single_item_booking_option_remains_in_deprecated_agents() -> None:
+    raw = {
+        "price": {"raw": 10}, "legs": [], "_agent_lookup": {"a": {"name": "Agent A"}},
+        "pricingOptions": [{"price": {"raw": 10}, "items": [{"agentId": "a", "price": {"raw": 10}, "deepLink": "https://example.invalid"}]}],
+    }
+    normalized = normalize_result(raw, {"IataCode": "WAW"}, {"IataCode": "ROM"}, "PLN")
+    assert normalized["agents"][0]["price"]["amount"] == "10.00"
+    assert normalized["booking_options"][0]["total_price"]["amount"] == "10.00"
 
 
 def test_missing_agent_reference_is_protocol_error() -> None:

@@ -1,6 +1,14 @@
 # Prywatne API Skyscannera — potwierdzony kontrakt eksperymentalny
 
-Stan na **2026-07-15**. Ten dokument opisuje requesty faktycznie wykonane przez działającą stronę i odtworzone przez `curl`. API jest prywatne, bez SLA i może zmienić endpoint, payload lub reguły ochrony.
+Stan na **2026-07-21**. Ten dokument opisuje requesty faktycznie wykonane przez działającą stronę i odtworzone przez klienta HTTP. API jest prywatne, bez SLA i może zmienić endpoint, payload lub reguły ochrony.
+
+## Explore / Everywhere
+
+Explore używa tego samego `POST /g/radar/api/v2/web-unified-search/`. Dla country discovery outbound ma `legDestination: {"@type":"everywhere"}`, a inbound odwrotny kierunek. Dla city expansion miejsce Everywhere zastępuje dynamicznie rozwiązaną encję wybranego kraju. Body zawiera `options.maxDestinations: 200`.
+
+Potwierdzone reprezentacje zakresu dat to `date` z rokiem, miesiącem i dniem, `month` z rokiem i miesiącem oraz `anytime` bez dodatkowych pól. Odpowiedź country ma korzeń `everywhereDestination`, a city — `countryDestination`. Kolekcje mają własny `context`, `features`, `buckets` i `results`. Publicznie użyteczne pola location to `skyCode`, `name`, `type` oraz kontynent; `flightQuotes` rozdziela cheapest/direct, a `flightRoutes.directFlightsAvailable` informuje o bezpośredniej trasie. Bucket `category: VIBES` jest zachowywany jako nieautorytatywny tag.
+
+Providerowe `result.id`, `location.id` i sessionId nigdy nie wychodzą w kontrakcie CLI. Ceny Explore są obserwacjami orientacyjnymi, a nie ofertami live; odpowiedź nie dostarcza autorytatywnego czasu obserwacji.
 
 ## Najważniejszy wynik
 
@@ -14,6 +22,8 @@ Po ręcznym przejściu CAPTCHA:
 - domyślny User-Agent curl: `403 {"reason":"blocked",...}`.
 
 Cookies nie były potrzebne w udanych replayach. Nie oznacza to, że nigdy nie będą wymagane. Ręczne CAPTCHA mogło poprawić reputację bieżącego IP lub przeglądarki; test nie rozstrzyga mechanizmu.
+
+Ponowna weryfikacja **2026-07-21** wykazała ważne ograniczenie: ukończenie challenge w trwałym, widocznym profilu przeglądarki nie odblokowało bezcookie HTTP używanego przez `flights doctor`; probe nadal zwrócił `BOT_CHALLENGE`. Zgodnie z polityką recovery nie wykonywano kolejnej pętli unlock/retry ani następujących po niej ręcznych testów country Explore, city expansion i live follow-up. `browser unlock` jest zatem pomocą dla człowieka, a nie gwarancją odblokowania stateless fast path; Agent musi jawnie zgłosić taki wynik użytkownikowi.
 
 ## Minimalny zestaw nagłówków Radar
 

@@ -1,0 +1,28 @@
+{
+  "countryDestination": {
+    "context": {"status": "complete", "totalResults": 2},
+    "features": {"flightsIndicative": "AVAILABLE"},
+    "buckets": [{"id": "ART_AND_CULTURE", "category": "VIBES", "resultIds": ["result-rome"]}],
+    "results": [
+      {
+        "id": "result-milan",
+        "type": "LOCATION",
+        "content": {
+          "location": {"id": "private-milan", "skyCode": "MILA", "name": "Mediolan", "type": "City", "continent": {"code": "EU", "name": "Europa"}},
+          "flightQuotes": {"cheapest": {"rawPrice": 196.0, "direct": true}, "direct": {"rawPrice": 196.0, "direct": true}},
+          "flightRoutes": {"directFlightsAvailable": true}
+        }
+      },
+      {
+        "id": "result-rome",
+        "type": "LOCATION",
+        "content": {
+          "location": {"id": "private-rome", "skyCode": "ROME", "name": "Rzym", "type": "City", "continent": {"code": "EU", "name": "Europa"}},
+          "flightQuotes": {"cheapest": {"rawPrice": 280.0, "direct": false}},
+          "flightRoutes": {"directFlightsAvailable": false}
+        }
+      }
+    ]
+  },
+  "context": {"status": "complete", "totalResults": 2}
+}

@@ -207,6 +207,60 @@ class SkyscannerWebProvider:
             delay = min(2.5, delay * 1.6)
         return latest, polls, complete
 
+    async def explore_one(
+        self,
+        origin: dict[str, Any],
+        destination: dict[str, Any] | None,
+        *,
+        depart: dict[str, str],
+        return_date: dict[str, str] | None,
+        adults: int,
+        child_ages: list[int],
+        cabin: str,
+        deadline: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, list[str]], int, int, bool]:
+        """Return provider Explore rows without exposing the provider collection shape."""
+        view_id = str(uuid.uuid4())
+        destination_ref = _explore_place(destination)
+        origin_ref = {"@type": "entity", "entityId": str(origin["GeoId"])}
+        legs = [{"legOrigin": origin_ref, "legDestination": destination_ref, "dates": depart}]
+        if return_date:
+            legs.append({"legOrigin": destination_ref, "legDestination": origin_ref, "dates": return_date})
+        body = {
+            "cabinClass": cabin.upper(),
+            "childAges": child_ages,
+            "adults": adults,
+            "legs": legs,
+            "options": {"maxDestinations": 200},
+        }
+        expected = "countryDestination" if destination else "everywhereDestination"
+        data = await self._request(
+            "POST", "/g/radar/api/v2/web-unified-search/", view_id=view_id, json=body, deadline=deadline
+        )
+        rows, tags, complete, total = _explore_collection(data, expected=expected)
+        snapshot = rows
+        snapshot_tags = tags
+        polls = 0
+        context = data[expected]["context"]
+        session_id = context.get("sessionId")
+        delay = 0.45
+        while not complete and isinstance(session_id, str) and time.monotonic() + delay < deadline:
+            await asyncio.sleep(delay)
+            data = await self._request(
+                "GET",
+                f"/g/radar/api/v2/web-unified-search/{quote(session_id, safe='')}",
+                view_id=view_id,
+                deadline=deadline,
+            )
+            current, current_tags, complete, total = _explore_collection(data, expected=expected)
+            if current:
+                snapshot, snapshot_tags = current, current_tags
+            polls += 1
+            next_session = data[expected]["context"].get("sessionId")
+            session_id = next_session or session_id
+            delay = min(2.5, delay * 1.6)
+        return snapshot, snapshot_tags, total, polls, complete
+
 
 def place_summary(place: dict[str, Any]) -> dict[str, Any]:
     return {k: place.get(k) for k in ("PlaceName", "IataCode", "CountryName", "CountryId", "GeoId", "GeoContainerId")}
@@ -223,6 +277,60 @@ def _radar_leg(origin: dict[str, Any], destination: dict[str, Any], day: date, p
 
 def _alt_leg(origin: dict[str, Any], destination: dict[str, Any], day: date) -> dict[str, Any]:
     return {"date": {"year": day.year, "month": day.month, "day": day.day}, "origin": [str(origin["GeoId"])], "destination": [str(destination["GeoId"])]}
+
+
+def _explore_place(place: dict[str, Any] | None) -> dict[str, str]:
+    if place is None:
+        return {"@type": "everywhere"}
+    return {"@type": "entity", "entityId": str(place["GeoId"])}
+
+
+def _explore_collection(
+    data: Any, *, expected: str
+) -> tuple[list[dict[str, Any]], dict[str, list[str]], bool, int]:
+    if not isinstance(data, dict) or not isinstance(data.get(expected), dict):
+        raise ProviderError("CONTRACT_CHANGED", f"Radar Explore response has no {expected} object")
+    collection = data[expected]
+    context = collection.get("context")
+    if not isinstance(context, dict):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore response has no context")
+    status = str(context.get("status", "")).lower()
+    if status not in {"complete", "incomplete"}:
+        raise ProviderError("CONTRACT_CHANGED", f"Unknown Radar Explore status: {status!r}")
+    if status == "incomplete" and not isinstance(context.get("sessionId"), str):
+        raise ProviderError("CONTRACT_CHANGED", "Incomplete Radar Explore response has no sessionId")
+    results = collection.get("results")
+    if not isinstance(results, list) or any(not isinstance(row, dict) for row in results):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore results must be a list of objects")
+    locations = []
+    for row in results:
+        if row.get("type") != "LOCATION":
+            # Explore interleaves ads and other presentation cards with locations.
+            continue
+        content = row.get("content")
+        location = content.get("location") if isinstance(content, dict) else None
+        if not isinstance(row.get("id"), str) or not isinstance(location, dict):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has no public location data")
+        if not isinstance(location.get("name"), str) or not isinstance(location.get("skyCode"), str):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore location has no name or skyCode")
+        locations.append(row)
+    buckets = collection.get("buckets", [])
+    if not isinstance(buckets, list) or any(not isinstance(bucket, dict) for bucket in buckets):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore buckets must be a list of objects")
+    tags: dict[str, list[str]] = {}
+    for bucket in buckets:
+        if bucket.get("category") != "VIBES":
+            continue
+        tag = bucket.get("id")
+        ids = bucket.get("resultIds", [])
+        if not isinstance(tag, str) or not isinstance(ids, list) or any(not isinstance(value, str) for value in ids):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore vibe bucket is malformed")
+        for result_id in ids:
+            tags.setdefault(result_id, []).append(tag)
+    total = context.get("totalResults", len(results))
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore totalResults must be a non-negative integer")
+    return locations, tags, status == "complete", total
 
 
 def _alt_session_incomplete(status: str) -> bool:

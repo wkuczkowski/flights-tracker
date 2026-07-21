@@ -1,0 +1,32 @@
+{
+  "everywhereDestination": {
+    "context": {"status": "complete", "totalResults": 2},
+    "features": {"flightsIndicative": "AVAILABLE"},
+    "buckets": [
+      {"id": "CHEAPEST_FLIGHTS", "category": "NON_CATEGORIZED", "resultIds": ["result-it", "result-es"]},
+      {"id": "BEACH", "category": "VIBES", "resultIds": ["result-it", "result-es"]},
+      {"id": "GREAT_FOOD", "category": "VIBES", "resultIds": ["result-it"]}
+    ],
+    "results": [
+      {
+        "id": "result-it",
+        "type": "LOCATION",
+        "content": {
+          "location": {"id": "private-it", "skyCode": "IT", "name": "Włochy", "type": "Nation", "continent": {"code": "EU", "name": "Europa"}},
+          "flightQuotes": {"cheapest": {"rawPrice": 259.0, "direct": true}, "direct": {"rawPrice": 259.0, "direct": true}},
+          "flightRoutes": {"directFlightsAvailable": true}
+        }
+      },
+      {
+        "id": "result-es",
+        "type": "LOCATION",
+        "content": {
+          "location": {"id": "private-es", "skyCode": "ES", "name": "Hiszpania", "type": "Nation", "continent": {"code": "EU", "name": "Europa"}},
+          "flightQuotes": {"cheapest": {"rawPrice": 349.5, "direct": false}},
+          "flightRoutes": {"directFlightsAvailable": false}
+        }
+      }
+    ]
+  },
+  "context": {"status": "complete", "totalResults": 2}
+}

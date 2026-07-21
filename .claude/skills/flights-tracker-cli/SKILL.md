@@ -1,6 +1,6 @@
 ---
 name: flights-tracker-cli
-description: Use the local `flights` CLI to resolve airports and cities, search and compare flights from one or many origins, inspect alternative dates, and return structured JSON for agent workflows. Trigger when Codex is asked to find flights, compare routes or prices, check flexible travel dates, diagnose provider access, or manually unlock a Skyscanner browser challenge.
+description: Use the local `flights` CLI to explore countries and cities, resolve airports, search and compare flights from one or many origins, inspect alternative dates, and return structured JSON for agent workflows. Trigger when Codex is asked to discover destinations, find flight deals, compare routes or prices, check flexible travel dates, diagnose provider access, or manually unlock a Skyscanner browser challenge.
 ---
 
 # Flights Tracker CLI
@@ -89,6 +89,33 @@ JSON
 
 Use `--request request.json` for an existing request file.
 
+## Explore destinations
+
+Use `explore` when the destination is open-ended. The CLI supplies objective indicative observations; you interpret subjective intent such as warm, interesting, or a deal. Work in two explicit stages:
+
+1. Explore countries with `destination_scope: {"level":"country","anywhere":true}`.
+2. Select promising countries yourself, then expand only those with `level: "city"`, `anywhere: false`, and public country `code` or `query` references.
+
+```bash
+flights explore --request - --json <<'JSON'
+{
+  "schema_version":"1.0",
+  "origins":[{"query":"Gdańsk"},{"query":"Poznań"},{"query":"Warszawa"}],
+  "destination_scope":{"level":"country","anywhere":true},
+  "trip":{"type":"round_trip","depart":{"scope":"month","month":"2026-09"},"return":{"scope":"month","month":"2026-09"}},
+  "passengers":{"adults":1,"children_ages":[]},
+  "cabin":"economy",
+  "filters":{"include_continents":["EU"],"direct_only":false},
+  "sort":"price","limit":50,
+  "market":"PL","locale":"pl-PL","currency":"PLN"
+}
+JSON
+```
+
+Date scopes are `exact` + `date`, `month` + `month`, or `anytime`. Treat prices as indicative complete-trip totals for the whole passenger group, not guaranteed offers. `no_quote` means no observed quote, not no flight. Provider tags are evidence, not authoritative destination qualities.
+
+Read every origin state, `partial_failures`, `warnings`, `observed_at`, and `meta.truncated`. Tell the user about failed origins and freshness uncertainty. Apply preferences conversationally; the CLI never loads preference files. Verify selected candidates through `search`, `alternative-dates`, or `flexible-search`. Do not automatically expand all countries.
+
 ## Check alternative dates
 
 Use the same route, passenger, market, locale, and currency conventions as search. Pass `--origin` repeatedly to compare date grids across several departure points:
@@ -166,3 +193,5 @@ flights doctor --json
 ```
 
 Preserve the user's dates, passengers, cabin, filters, and locale across retries. Summarize the best results with total price, origin, airports, times, stops, carriers, and any self-transfer or partial-result warnings.
+
+For live results, use `booking_options[].total_price` as the complete price. When `requires_multiple_bookings` is true, nested `booking_items[].price` values are components and must not be compared with complete trips. Treat legacy `agents[]` as deprecated.

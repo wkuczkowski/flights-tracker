@@ -21,6 +21,7 @@ from .service import (
     request_id,
     resolve,
     run_alternative_dates,
+    run_explore,
     run_flexible_search,
     run_search,
 )
@@ -46,6 +47,8 @@ def parser() -> argparse.ArgumentParser:
     _alt_dates_args(a); a.add_argument("--request", metavar="FILE", help="Read JSON request from FILE or -"); _json_flag(a)
     f = sub.add_parser("flexible-search", help="Pick top alternative dates then run live searches")
     _flexible_args(f); f.add_argument("--request", metavar="FILE", help="Read JSON request from FILE or -"); _json_flag(f)
+    e = sub.add_parser("explore", help="Discover countries or expand selected countries into cities")
+    e.add_argument("--request", metavar="FILE", required=True, help="Read complete JSON request from FILE or -"); _json_flag(e)
     d = sub.add_parser("doctor", help="Probe endpoint access and contract without creating a flight search")
     _culture(d); _json_flag(d)
     b = sub.add_parser("browser", help="Manual browser challenge helpers")
@@ -144,6 +147,17 @@ def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return data
 
 
+def _structured_request(path: str) -> dict[str, Any]:
+    try:
+        text = sys.stdin.read() if path == "-" else Path(path).read_text()
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FlightsError("INVALID_ARGUMENT", f"Cannot read JSON request: {exc}") from None
+    if not isinstance(data, dict):
+        raise FlightsError("INVALID_ARGUMENT", "JSON request must be an object")
+    return data
+
+
 async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "places":
         query = args.query or args.query_positional
@@ -152,6 +166,8 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return await resolve(query, destination=args.destination, market=args.market, locale=args.locale, currency=args.currency)
     if args.command == "search":
         return await run_search(_request_from_args(args), timeout=args.timeout)
+    if args.command == "explore":
+        return await run_explore(_structured_request(args.request))
     if args.command == "alternative-dates":
         response = await run_alternative_dates(_request_from_args(args), timeout=args.timeout)
         response.pop("_all_results", None)

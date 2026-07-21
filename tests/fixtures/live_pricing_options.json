@@ -1,0 +1,20 @@
+{
+  "itineraries": {
+    "agents": {
+      "agent-a": {"name": "Agent A"},
+      "agent-b": {"name": "Agent B"}
+    },
+    "results": [{
+      "price": {"raw": 22},
+      "legs": [],
+      "pricingOptions": [{
+        "price": {"raw": 22},
+        "transferType": "SELF_TRANSFER",
+        "items": [
+          {"agentId": "agent-a", "price": {"raw": 10}, "deepLink": "https://example.invalid/a"},
+          {"agentId": "agent-b", "price": {"raw": 12}, "deepLink": "https://example.invalid/b"}
+        ]
+      }]
+    }]
+  }
+}

@@ -8,6 +8,43 @@
 - kwoty są decimal-string, nie `float`; daty są `YYYY-MM-DD`. Czasy lotów są lokalne dla lotniska, bo provider nie zwraca offsetów; pole offset/timezone pozostaje `null`, dopóki autorytatywny resolver stref nie wzbogaci wyniku.
 - `--request -` jest preferowany dla Agenta, bo omija quoting shella.
 
+## Wejście i wyjście explore
+
+`explore` jest obiektywnym prymitywem discovery. Agent interpretuje intencję typu „ciepło” albo „okazja”, wybiera kraje do rozwinięcia i osobno uruchamia live `search`. CLI nie ładuje preferencji użytkownika.
+
+```json
+{
+  "schema_version": "1.0",
+  "origins": [{"query": "Gdańsk"}, {"query": "Poznań"}, {"query": "Warszawa"}],
+  "destination_scope": {"level": "country", "anywhere": true},
+  "trip": {
+    "type": "round_trip",
+    "depart": {"scope": "month", "month": "2026-09"},
+    "return": {"scope": "month", "month": "2026-09"}
+  },
+  "passengers": {"adults": 1, "children_ages": []},
+  "cabin": "economy",
+  "stay": {"min_nights": 5, "max_nights": 9},
+  "filters": {
+    "include_continents": ["Europe"],
+    "exclude_destinations": [],
+    "max_price": {"amount": "700.00", "currency": "PLN"},
+    "direct_only": false
+  },
+  "sort": "price",
+  "limit": 50,
+  "market": "PL", "locale": "pl-PL", "currency": "PLN"
+}
+```
+
+Zakres daty to jeden z: `{"scope":"exact","date":"YYYY-MM-DD"}`, `{"scope":"month","month":"YYYY-MM"}` albo `{"scope":"anytime"}`. `trip.type` jest obowiązkowe. Round trip wymaga niezależnego `trip.return`; one way je odrzuca. `anytime` nie gwarantuje długości pobytu.
+
+Country discovery wymaga `level: "country"` i `anywhere: true`. City expansion używa `level: "city"`, `anywhere: false` oraz `countries`, np. `[{"code":"IT"},{"query":"Hiszpania"}]`. Publiczne requesty i odpowiedzi nie zawierają providerowych entity IDs. `limit` domyślnie wynosi 50 i przyjmuje 1–200. Filtry kontynentów, destynacji, ceny całej grupy i `direct_only` są stosowane przed limitem. Jedyny ranking CLI to deterministyczna cena.
+
+Każdy wynik ma publiczną `destination`, `best_price`, `best_direct_price`, nieautorytatywne `provider_tags` oraz wszystkie `origin_options`. Stan originu to `quoted`, `no_quote` albo `failed`. `no_quote` oznacza brak obserwacji ceny, nie brak lotu; `failed` zawiera stabilny kod i retryability. Cena jest orientacyjnym totalem kompletnej podróży całej grupy.
+
+`searched_at` jest czasem pobrania. Gdy provider nie podaje czasu obserwacji, `observed_at` pozostaje `null`. Stay jest adnotacją: konkretne daty dają `nights` i boolowskie `stay_match`, a month/anytime — `unknown`. `meta` zawiera `total_candidates`, `returned_candidates` i `truncated`. Agent powinien ujawnić partial failures i niepewność świeżości, a wybrany wynik sprawdzić przez `alternative-dates`, `flexible-search` albo live `search`.
+
 ## Wejście search
 
 ```json
@@ -80,6 +117,16 @@ Reguły walidacji:
       "price": {"amount": "499.00", "currency": "PLN"},
       "deeplink": "https://example.invalid/redacted"
     }],
+    "booking_options": [{
+      "total_price": {"amount": "499.00", "currency": "PLN"},
+      "requires_multiple_bookings": false,
+      "transfer_type": null,
+      "booking_items": [{
+        "agent_name": "Example Agent",
+        "price": {"amount": "499.00", "currency": "PLN"},
+        "deeplink": "https://example.invalid/redacted"
+      }]
+    }],
     "is_self_transfer": false,
     "sustainability": {
       "is_eco_contender": false,
@@ -101,6 +148,8 @@ Reguły walidacji:
   }
 }
 ```
+
+`booking_options[].total_price` jest autorytatywną ceną kompletnej opcji. Przy `requires_multiple_bookings: true` ceny `booking_items[]` są częściami podróży i nie wolno przedstawiać ich jako pełnej ceny. `agents[]` jest deprecated i zawiera wyłącznie jednoelementowe opcje, których cena reprezentuje całą opcję.
 
 `status` przyjmuje `complete`, `partial` lub `failed`. Użyteczny wynik częściowy ma exit `0` i ostrzeżenia. Awaria wszystkich originów ma `failed` i kod niezerowy. Brak ofert jest poprawną odpowiedzią `complete` z pustym `results`, a nie awarią providera.
 
