@@ -23,7 +23,9 @@ Po ręcznym przejściu CAPTCHA:
 
 Cookies nie były potrzebne w udanych replayach. Nie oznacza to, że nigdy nie będą wymagane. Ręczne CAPTCHA mogło poprawić reputację bieżącego IP lub przeglądarki; test nie rozstrzyga mechanizmu.
 
-Ponowna weryfikacja **2026-07-21** wykazała ważne ograniczenie: ukończenie challenge w trwałym, widocznym profilu przeglądarki nie odblokowało bezcookie HTTP używanego przez `flights doctor`; probe nadal zwrócił `BOT_CHALLENGE`. Zgodnie z polityką recovery nie wykonywano kolejnej pętli unlock/retry ani następujących po niej ręcznych testów country Explore, city expansion i live follow-up. `browser unlock` jest zatem pomocą dla człowieka, a nie gwarancją odblokowania stateless fast path; Agent musi jawnie zgłosić taki wynik użytkownikowi.
+Ponowna weryfikacja **2026-07-21** wykazała ważne ograniczenie operacyjne. Pierwszy challenge ukończony przez wrapper `flights browser unlock` nie odblokował bezcookie HTTP używanego przez `flights doctor`. Dopiero challenge ukończony w bezpośrednio otwartej, nazwanej sesji `playwright-cli` z jawnym trwałym profilem pozwolił wykonać pojedynczy uzgodniony retry: country Explore, city expansion i live follow-up zakończyły się `complete`. Unlock jest zatem pomocą dla człowieka, a nie gwarancją odblokowania stateless fast path. Agent powinien najpierw potwierdzić działanie tej samej interaktywnej sesji, wykonać oryginalny request tylko raz i jawnie zgłosić kolejną blokadę zamiast zapętlać recovery.
+
+Porównanie UI Explore i CLI dla tego samego originu i dat, wykonane w odstępie kilkudziesięciu sekund, pokazało różne kwoty orientacyjne (np. Włochy). Jest to oczekiwany dowód na cache, aktualizację lub kontekst prezentacji, a nie błąd arytmetyczny CLI. Takich wartości nie wolno utrwalać jako stabilnych asercji ani przedstawiać jako ofert live.
 
 ## Minimalny zestaw nagłówków Radar
 
