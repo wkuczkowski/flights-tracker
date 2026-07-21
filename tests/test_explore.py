@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -10,7 +12,7 @@ import pytest
 from flights_tracker.cli import dispatch, parser
 from flights_tracker.errors import FlightsError, ProviderError
 from flights_tracker.provider import ExploreResult, ExploreSnapshot, _explore_collection
-from flights_tracker.service import run_explore, validate_explore_request
+from flights_tracker.service import _public_explore_filter_place, run_explore, validate_explore_request
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -55,6 +57,7 @@ def autosuggest(query: str) -> dict:
         "POZ": {"PlaceName": "Poznań", "IataCode": "POZ", "GeoId": "origin-poz", "CountryId": "PL"},
         "GDN": {"PlaceName": "Gdańsk", "IataCode": "GDN", "GeoId": "origin-gdn", "CountryId": "PL"},
         "IT": {"PlaceName": "Włochy", "GeoId": "country-it", "CountryId": "IT", "CountryName": "Włochy"},
+        "Italy": {"PlaceName": "Włochy", "GeoId": "country-it", "CountryId": "IT", "CountryName": "Włochy"},
     }
     return values[query]
 
@@ -128,6 +131,79 @@ async def test_cli_dispatches_real_explore_seam_with_mixed_scopes_and_partial_pr
     assert output["partial_failures"] == [{"origin": "POZ", "code": "PROVIDER_TIMEOUT", "retryable": True}]
 
 
+@pytest.mark.asyncio
+async def test_completed_origin_resolution_survives_hanging_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancelled = asyncio.Event()
+
+    class FakeProvider:
+        def __init__(self, client, *, culture):
+            pass
+
+        async def resolve_place(self, query, *, destination=False):
+            if query == "POZ":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            return autosuggest(query)
+
+        async def explore_one(self, origin, destination, **kwargs):
+            return ExploreSnapshot(
+                results=[ExploreResult(
+                    code="IT", name="Włochy", continent_code="EU", continent_name="Europa",
+                    cheapest_price={"amount": "250.00", "currency": "PLN"},
+                    cheapest_direct_price=None, direct_flights_available=False, provider_tags=(),
+                )],
+                total_results=1, complete=True,
+            )
+
+    monkeypatch.setattr("flights_tracker.service.SkyscannerWebProvider", FakeProvider)
+    req = request()
+    req["timeout"] = 0.4
+    response = await run_explore(req)
+    assert response["status"] == "partial"
+    assert [option["state"] for option in response["results"][0]["origin_options"]] == ["quoted", "failed"]
+    assert response["partial_failures"][0]["code"] == "PROVIDER_TIMEOUT"
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_resolution_bot_challenge_promptly_cancels_hanging_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    hanging_started = asyncio.Event()
+    hanging_cancelled = asyncio.Event()
+    radar_calls = 0
+
+    class FakeProvider:
+        def __init__(self, client, *, culture):
+            pass
+
+        async def resolve_place(self, query, *, destination=False):
+            if query == "POZ":
+                hanging_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    hanging_cancelled.set()
+                    raise
+            await hanging_started.wait()
+            raise ProviderError("BOT_CHALLENGE", "blocked")
+
+        async def explore_one(self, *args, **kwargs):
+            nonlocal radar_calls
+            radar_calls += 1
+            raise AssertionError("Radar must not start")
+
+    monkeypatch.setattr("flights_tracker.service.SkyscannerWebProvider", FakeProvider)
+    started = time.monotonic()
+    with pytest.raises(FlightsError) as caught:
+        await run_explore(request())
+    assert caught.value.code == "BOT_CHALLENGE"
+    assert time.monotonic() - started < 0.5
+    assert hanging_cancelled.is_set()
+    assert radar_calls == 0
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -155,6 +231,15 @@ def test_explore_date_scopes_map_to_provider_contract() -> None:
     assert validate_explore_request(req)["_depart"] == {"@type": "month", "year": "2026", "month": "09"}
     req["trip"]["depart"] = {"scope": "anytime"}
     assert validate_explore_request(req)["_depart"] == {"@type": "anytime"}
+
+
+def test_filter_public_identity_never_promotes_private_place_or_country_ids() -> None:
+    assert _public_explore_filter_place(
+        {"CountryId": "private-country", "CountryName": "Włochy"}, "country"
+    ) == {"name": "Włochy"}
+    assert _public_explore_filter_place(
+        {"PlaceId": "private-city", "PlaceName": "Mediolan"}, "city"
+    ) == {"name": "Mediolan"}
 
 
 def test_provider_contract_fixture_is_sanitized_and_strict() -> None:
@@ -218,6 +303,44 @@ async def test_filters_run_before_limit_and_direct_only_uses_direct_price() -> N
 
 
 @pytest.mark.asyncio
+async def test_text_destination_filter_is_resolved_before_localized_matching() -> None:
+    req = request()
+    req["filters"] = {"direct_only": False, "include_destinations": [{"query": "Italy"}]}
+    response = await run_explore(req, transport=explore_transport())
+    assert [result["destination"]["code"] for result in response["results"]] == ["IT"]
+    assert "country-it" not in json.dumps(response)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_text_destination_filter_propagates_choices_without_radar() -> None:
+    radar_calls = 0
+
+    def handler(call: httpx.Request) -> httpx.Response:
+        nonlocal radar_calls
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            if query == "Springfield":
+                return httpx.Response(200, json=[
+                    {"PlaceName": "Springfield", "GeoId": "private-us", "CountryId": "private-country", "CountryName": "USA"},
+                    {"PlaceName": "Springfield", "GeoId": "private-ca", "CountryId": "CA", "CountryName": "Kanada"},
+                ])
+            return httpx.Response(200, json=[autosuggest(query)])
+        radar_calls += 1
+        return httpx.Response(500)
+
+    req = request()
+    req["filters"] = {"direct_only": False, "include_destinations": [{"query": "Springfield"}]}
+    with pytest.raises(FlightsError) as caught:
+        await run_explore(req, transport=httpx.MockTransport(handler))
+    assert caught.value.code == "AMBIGUOUS_PLACE"
+    assert caught.value.details["choices"] == [
+        {"name": "USA"}, {"code": "CA", "name": "Kanada"},
+    ]
+    assert "private-" not in json.dumps(caught.value.details)
+    assert radar_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_city_expansion_adds_selected_country_public_identity() -> None:
     response = await run_explore(request(level="city"), transport=explore_transport("city"))
     milan = response["results"][0]
@@ -244,7 +367,7 @@ async def test_completed_origin_survives_when_other_origin_hits_overall_deadline
             return httpx.Response(200, json=[autosuggest(query)])
         origin_id = json.loads(call.content)["legs"][0]["legOrigin"]["entityId"]
         if origin_id == "origin-poz":
-            await __import__("asyncio").sleep(1)
+            await asyncio.sleep(1)
         return httpx.Response(200, json=fixture("explore_everywhere.json"))
 
     req = request()

@@ -35,6 +35,8 @@ Jawna macierz regresyjna Explore dla preferowanych originów:
 
 Osobna regresja utrzymuje wynik ukończonego originu, gdy drugi task nadal trwa w momencie wyczerpania wspólnego deadline. Niedokończony task otrzymuje jawny per-origin timeout; orchestrator nie odrzuca ukończonych outcomes.
 
+Resolver originów ma osobne regresje dla ukończonego WAW i wiszącego POZ oraz dla `BOT_CHALLENGE` równoległego z wiszącym resolverem. Pierwszy przypadek zachowuje użyteczny partial, drugi natychmiast anuluje pozostały Autosuggest i nie uruchamia Radar. Tekstowe filtry destynacji testują lokalizowane rozwiązanie `Italy` → `Włochy` oraz propagację `AMBIGUOUS_PLACE` bez providerowego fan-outu.
+
 ### Contract/fixtures
 
 Fixture prywatnego Radar/Autosuggest musi być sanitizowana i walidowana przeciw własnemu modelowi. Testy sprawdzają brakujące pola, nieznane enumy i zmianę kształtu odpowiedzi. CI domyślnie używa mock HTTP bez sieci. Smoke test live ma niski fan-out, osobny marker i nie działa domyślnie.

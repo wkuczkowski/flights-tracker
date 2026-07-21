@@ -408,6 +408,104 @@ def _matches_references(destination: dict[str, Any], references: list[Any]) -> b
     return any(available & _reference_tokens(reference) for reference in references)
 
 
+async def _resolve_explore_filter_queries(req: dict[str, Any], provider: Any, deadline: float) -> None:
+    level = req["destination_scope"]["level"]
+    for filter_name in ("include_destinations", "exclude_destinations"):
+        resolved_references = []
+        for reference in req["filters"].get(filter_name, []):
+            if not isinstance(reference, dict) or not reference.get("query"):
+                resolved_references.append(reference)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving destination filters", retryable=True)
+            try:
+                place = await asyncio.wait_for(
+                    provider.resolve_place(reference["query"], destination=True), remaining
+                )
+            except TimeoutError as exc:
+                raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving destination filters", retryable=True) from exc
+            except FlightsError as exc:
+                if exc.code != "AMBIGUOUS_PLACE":
+                    raise
+                choices = [
+                    _public_explore_filter_place(choice, level)
+                    for choice in exc.details.get("choices", [])
+                    if isinstance(choice, dict)
+                ]
+                raise FlightsError(
+                    exc.code, exc.message, retryable=exc.retryable,
+                    details={"choices": [choice for choice in choices if choice]},
+                ) from None
+            public = _public_explore_filter_place(place, level)
+            if not public:
+                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved destination filter has no public identity")
+            resolved_references.append(public)
+        req["filters"][filter_name] = resolved_references
+
+
+def _public_explore_filter_place(place: dict[str, Any], level: str) -> dict[str, str]:
+    if level == "country":
+        raw_code = place.get("CountryId")
+        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{2}", raw_code) else None
+        values = {
+            "code": code,
+            "name": place.get("CountryName") or place.get("PlaceName"),
+        }
+    else:
+        raw_code = place.get("IataCode")
+        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{3,4}", raw_code) else None
+        values = {
+            "code": code,
+            "name": place.get("PlaceName"),
+        }
+    return {key: value for key, value in values.items() if isinstance(value, str) and value}
+
+
+async def _resolve_explore_origins(
+    values: list[dict[str, Any]], provider: Any, *, concurrency: int, deadline: float,
+) -> list[dict[str, Any] | FlightsError]:
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
+
+    async def resolve(index: int, value: dict[str, Any]) -> tuple[int, dict[str, Any] | FlightsError]:
+        try:
+            async with semaphore:
+                place = await provider.resolve_place(value.get("query") or value.get("iata"), destination=False)
+            return index, place
+        except FlightsError as exc:
+            return index, exc
+
+    outcomes: list[dict[str, Any] | FlightsError | None] = [None] * len(values)
+    tasks = {asyncio.create_task(resolve(index, value)): index for index, value in enumerate(values)}
+    pending = set(tasks)
+    while pending and (remaining := deadline - time.monotonic()) > 0:
+        done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            break
+        for completed in done:
+            index, outcome = await completed
+            outcomes[index] = outcome
+            if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise outcome
+    finished = {task for task in pending if task.done()}
+    for completed in finished:
+        index, outcome = await completed
+        outcomes[index] = outcome
+    pending -= finished
+    for task in pending:
+        task.cancel()
+        outcomes[tasks[task]] = ProviderError("PROVIDER_TIMEOUT", "Origin resolution deadline reached", retryable=True)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return [
+        outcome if outcome is not None else ProviderError("PROVIDER_TIMEOUT", "Origin resolution deadline reached", retryable=True)
+        for outcome in outcomes
+    ]
+
+
 async def run_explore(
     req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -419,25 +517,13 @@ async def run_explore(
     level = req["destination_scope"]["level"]
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(25, connect=5), follow_redirects=False, transport=transport) as client:
         provider = SkyscannerWebProvider(client, culture=culture)
-        resolve_semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
-
-        async def resolve_origin(value: dict[str, Any]) -> dict[str, Any] | FlightsError:
-            try:
-                async with resolve_semaphore:
-                    return await provider.resolve_place(value.get("query") or value.get("iata"), destination=False)
-            except FlightsError as exc:
-                return exc
-
+        await _resolve_explore_filter_queries(req, provider, deadline)
+        resolution_budget = min(10.0, max(0.05, (deadline - started) * 0.25))
+        resolution_deadline = min(deadline, time.monotonic() + resolution_budget)
         try:
-            origins = await asyncio.wait_for(
-                asyncio.gather(*(resolve_origin(value) for value in req["origins"])),
-                max(0.001, deadline - time.monotonic()),
+            origins = await _resolve_explore_origins(
+                req["origins"], provider, concurrency=concurrency, deadline=resolution_deadline,
             )
-            resolution_challenge = next(
-                (value for value in origins if isinstance(value, FlightsError) and value.code == "BOT_CHALLENGE"), None
-            )
-            if resolution_challenge:
-                raise resolution_challenge
             country_inputs = req["destination_scope"].get("countries", []) if level == "city" else [None]
             countries = []
             for value in country_inputs:
