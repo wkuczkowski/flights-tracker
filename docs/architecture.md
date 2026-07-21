@@ -11,7 +11,7 @@ argv/stdin -> walidacja -> place resolver -> search orchestrator
 
 `explore` używa równoległej ścieżki discovery: Anywhere zwraca kraje, a jawnie wybrane encje krajów zwracają miasta. Orchestrator grupuje obserwacje po publicznej destynacji, zachowuje stany każdego originu (`quoted`, `no_quote`, `failed`), filtruje, sortuje po cenie i dopiero wtedy stosuje limit. Providerowe identyfikatory służą wyłącznie wewnętrznie.
 
-Interfejs providera oddziela modele domenowe od prywatnego JSON: operacje live search, alternative dates i Explore parsują prywatny kontrakt wewnątrz `SkyscannerWebProvider`. Explore zwraca wyłącznie znormalizowane `ExploreSnapshot` / `ExploreResult`; warstwa service nie interpretuje `everywhereDestination`, bucketów, quote'ów ani providerowych ID. Jedynym providerem jest `skyscanner_web`. Fast path używa klienta HTTP bez cookies; pomocniczy browser służy wyłącznie do ręcznego unlock.
+Interfejs providera oddziela modele domenowe od prywatnego JSON: operacje live search, alternative dates i Explore parsują prywatny kontrakt wewnątrz `SkyscannerWebProvider`. Explore zwraca wyłącznie znormalizowane `ExploreSnapshot` / `ExploreResult`, a Autosuggest dla filtrów i wybranych krajów — `ResolvedExplorePlace` z osobną publiczną tożsamością. Warstwa service nie interpretuje `everywhereDestination`, bucketów, quote'ów ani surowych pól Autosuggest; providerowe ID pozostaje wyłącznie wewnętrznym kluczem requestu. Jedynym providerem jest `skyscanner_web`. Fast path używa klienta HTTP bez cookies; pomocniczy browser służy wyłącznie do ręcznego unlock.
 
 ## WAW, POZ lub GDN
 

@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from .errors import FlightsError, ProviderError
-from .provider import BASE_URL, Culture, SkyscannerWebProvider, decimal_string, place_summary
+from .provider import BASE_URL, Culture, ResolvedExplorePlace, SkyscannerWebProvider, decimal_string, place_summary
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _TIME_FILTER_KEYS = ("depart_after", "depart_before", "return_after", "return_before")
@@ -359,11 +359,11 @@ def _public_label(original: dict[str, Any], resolved: dict[str, Any] | None = No
     return str(original.get("iata") or original.get("query") or (resolved or {}).get("IataCode") or (resolved or {}).get("PlaceName"))
 
 
-def _public_country(original: dict[str, Any], resolved: dict[str, Any]) -> dict[str, str]:
-    return {
-        "code": str(original.get("code") or resolved.get("CountryId") or "").upper(),
-        "name": str(resolved.get("CountryName") or resolved.get("PlaceName") or original.get("query") or original.get("code")),
-    }
+def _selected_country_public(original: dict[str, Any], resolved: ResolvedExplorePlace) -> dict[str, str]:
+    public = resolved.public.as_dict()
+    if original.get("code"):
+        public["code"] = str(original["code"]).upper()
+    return public
 
 
 def _stay_annotation(req: dict[str, Any]) -> tuple[int | None, bool | str]:
@@ -421,45 +421,12 @@ async def _resolve_explore_filter_queries(req: dict[str, Any], provider: Any, de
                 raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving destination filters", retryable=True)
             try:
                 place = await asyncio.wait_for(
-                    provider.resolve_place(reference["query"], destination=True), remaining
+                    provider.resolve_explore_place(reference["query"], level=level), remaining
                 )
             except TimeoutError as exc:
                 raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving destination filters", retryable=True) from exc
-            except FlightsError as exc:
-                if exc.code != "AMBIGUOUS_PLACE":
-                    raise
-                choices = [
-                    _public_explore_filter_place(choice, level)
-                    for choice in exc.details.get("choices", [])
-                    if isinstance(choice, dict)
-                ]
-                raise FlightsError(
-                    exc.code, exc.message, retryable=exc.retryable,
-                    details={"choices": [choice for choice in choices if choice]},
-                ) from None
-            public = _public_explore_filter_place(place, level)
-            if not public:
-                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved destination filter has no public identity")
-            resolved_references.append(public)
+            resolved_references.append(place.public.as_dict())
         req["filters"][filter_name] = resolved_references
-
-
-def _public_explore_filter_place(place: dict[str, Any], level: str) -> dict[str, str]:
-    if level == "country":
-        raw_code = place.get("CountryId")
-        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{2}", raw_code) else None
-        values = {
-            "code": code,
-            "name": place.get("CountryName") or place.get("PlaceName"),
-        }
-    else:
-        raw_code = place.get("IataCode")
-        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{3,4}", raw_code) else None
-        values = {
-            "code": code,
-            "name": place.get("PlaceName"),
-        }
-    return {key: value for key, value in values.items() if isinstance(value, str) and value}
 
 
 async def _resolve_explore_origins(
@@ -531,7 +498,7 @@ async def run_explore(
                     countries.append(None)
                 else:
                     countries.append(await asyncio.wait_for(
-                        provider.resolve_place(value.get("code") or value.get("query"), destination=True),
+                        provider.resolve_explore_place(value.get("code") or value.get("query"), level="country"),
                         max(0.001, deadline - time.monotonic()),
                     ))
         except TimeoutError as exc:
@@ -541,7 +508,7 @@ async def run_explore(
         bot_event = asyncio.Event()
         passengers = req["passengers"]
 
-        async def one(country_index: int, origin_index: int, origin: dict[str, Any], country: dict[str, Any] | None) -> tuple[Any, ...] | FlightsError:
+        async def one(country_index: int, origin_index: int, origin: dict[str, Any], country: ResolvedExplorePlace | None) -> tuple[Any, ...] | FlightsError:
             async with semaphore:
                 if bot_event.is_set():
                     return ProviderError("BOT_CHALLENGE", "Skyscanner blocked this network session")
@@ -563,7 +530,7 @@ async def run_explore(
                 for country_index in range(len(countries)):
                     outcomes[(country_index, origin_index)] = origin
 
-        async def indexed(country_index: int, origin_index: int, origin: dict[str, Any], country: dict[str, Any] | None) -> tuple[tuple[int, int], Any]:
+        async def indexed(country_index: int, origin_index: int, origin: dict[str, Any], country: ResolvedExplorePlace | None) -> tuple[tuple[int, int], Any]:
             return (country_index, origin_index), await one(country_index, origin_index, origin, country)
 
         tasks = {
@@ -606,7 +573,7 @@ async def run_explore(
         if isinstance(outcome, FlightsError):
             failure = {"origin": _public_label(original), "code": outcome.code, "retryable": outcome.retryable}
             if level == "city":
-                failure["country"] = _public_country(country_inputs[country_index], countries[country_index])
+                failure["country"] = _selected_country_public(country_inputs[country_index], countries[country_index])
             failures.append(failure)
             continue
         _, _, snapshot = outcome
@@ -625,7 +592,7 @@ async def run_explore(
             else:
                 destination = {
                     "level": "city", "code": code, "name": provider_result.name,
-                    "country": _public_country(country_inputs[country_index], countries[country_index]),
+                    "country": _selected_country_public(country_inputs[country_index], countries[country_index]),
                     "continent": public_continent,
                 }
             group = grouped.setdefault(key, {"destination": destination, "provider_tags": set(), "options": {}})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 import unicodedata
 import uuid
@@ -43,6 +44,21 @@ class ExploreResult:
     direct_flights_available: bool
     provider_tags: tuple[str, ...]
     observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class PublicPlaceIdentity:
+    name: str
+    code: str | None = None
+
+    def as_dict(self) -> dict[str, str]:
+        return {key: value for key, value in (("code", self.code), ("name", self.name)) if value}
+
+
+@dataclass(frozen=True)
+class ResolvedExplorePlace:
+    entity_id: str
+    public: PublicPlaceIdentity
 
 
 @dataclass(frozen=True)
@@ -157,6 +173,28 @@ class SkyscannerWebProvider:
             raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved place has no GeoId")
         return selected
 
+    async def resolve_explore_place(self, query: str, *, level: str) -> ResolvedExplorePlace:
+        if level not in {"country", "city"}:
+            raise FlightsError("INVALID_ARGUMENT", "Explore place level must be country or city")
+        try:
+            raw = await self.resolve_place(query, destination=True)
+        except FlightsError as exc:
+            if exc.code != "AMBIGUOUS_PLACE":
+                raise
+            choices = [
+                identity.as_dict()
+                for choice in exc.details.get("choices", [])
+                if isinstance(choice, dict)
+                if (identity := _public_explore_identity(choice, level=level)) is not None
+            ]
+            raise FlightsError(
+                exc.code, exc.message, retryable=exc.retryable, details={"choices": choices}
+            ) from None
+        identity = _public_explore_identity(raw, level=level)
+        if identity is None:
+            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved Explore place has no public identity")
+        return ResolvedExplorePlace(entity_id=str(raw["GeoId"]), public=identity)
+
     async def search_one(self, origin: dict[str, Any], destination: dict[str, Any], *, depart: date,
                          return_date: date | None, adults: int, child_ages: list[int], cabin: str,
                          deadline: float, _recreated: bool = False) -> tuple[list[dict[str, Any]], int, bool]:
@@ -232,7 +270,7 @@ class SkyscannerWebProvider:
     async def explore_one(
         self,
         origin: dict[str, Any],
-        destination: dict[str, Any] | None,
+        destination: ResolvedExplorePlace | None,
         *,
         depart: dict[str, str],
         return_date: dict[str, str] | None,
@@ -310,10 +348,24 @@ def _alt_leg(origin: dict[str, Any], destination: dict[str, Any], day: date) -> 
     return {"date": {"year": day.year, "month": day.month, "day": day.day}, "origin": [str(origin["GeoId"])], "destination": [str(destination["GeoId"])]}
 
 
-def _explore_place(place: dict[str, Any] | None) -> dict[str, str]:
+def _explore_place(place: ResolvedExplorePlace | None) -> dict[str, str]:
     if place is None:
         return {"@type": "everywhere"}
-    return {"@type": "entity", "entityId": str(place["GeoId"])}
+    return {"@type": "entity", "entityId": place.entity_id}
+
+
+def _public_explore_identity(place: dict[str, Any], *, level: str) -> PublicPlaceIdentity | None:
+    if level == "country":
+        raw_code = place.get("CountryId")
+        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{2}", raw_code) else None
+        name = place.get("CountryName") or place.get("PlaceName")
+    else:
+        raw_code = place.get("IataCode")
+        code = raw_code.upper() if isinstance(raw_code, str) and re.fullmatch(r"[A-Za-z]{3,4}", raw_code) else None
+        name = place.get("PlaceName")
+    if not isinstance(name, str) or not name:
+        return None
+    return PublicPlaceIdentity(name=name, code=code)
 
 
 def _explore_collection(

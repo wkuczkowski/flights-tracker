@@ -11,8 +11,13 @@ import pytest
 
 from flights_tracker.cli import dispatch, parser
 from flights_tracker.errors import FlightsError, ProviderError
-from flights_tracker.provider import ExploreResult, ExploreSnapshot, _explore_collection
-from flights_tracker.service import _public_explore_filter_place, run_explore, validate_explore_request
+from flights_tracker.provider import (
+    ExploreResult,
+    ExploreSnapshot,
+    _explore_collection,
+    _public_explore_identity,
+)
+from flights_tracker.service import run_explore, validate_explore_request
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -234,12 +239,14 @@ def test_explore_date_scopes_map_to_provider_contract() -> None:
 
 
 def test_filter_public_identity_never_promotes_private_place_or_country_ids() -> None:
-    assert _public_explore_filter_place(
-        {"CountryId": "private-country", "CountryName": "Włochy"}, "country"
-    ) == {"name": "Włochy"}
-    assert _public_explore_filter_place(
-        {"PlaceId": "private-city", "PlaceName": "Mediolan"}, "city"
-    ) == {"name": "Mediolan"}
+    country = _public_explore_identity(
+        {"CountryId": "private-country", "CountryName": "Włochy"}, level="country"
+    )
+    city = _public_explore_identity(
+        {"PlaceId": "private-city", "PlaceName": "Mediolan"}, level="city"
+    )
+    assert country is not None and country.as_dict() == {"name": "Włochy"}
+    assert city is not None and city.as_dict() == {"name": "Mediolan"}
 
 
 def test_provider_contract_fixture_is_sanitized_and_strict() -> None:
@@ -349,6 +356,73 @@ async def test_city_expansion_adds_selected_country_public_identity() -> None:
         "country": {"code": "IT", "name": "Włochy"},
         "continent": {"code": "EU", "name": "Europa"},
     }
+
+
+@pytest.mark.asyncio
+async def test_city_expansion_and_partial_failure_never_expose_opaque_country_identity() -> None:
+    def handler(call: httpx.Request) -> httpx.Response:
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            if query == "Włochy":
+                return httpx.Response(200, json=[{
+                    "PlaceName": "Włochy",
+                    "CountryName": "Włochy",
+                    "CountryId": "opaque-country-id",
+                    "GeoId": "private-country-entity",
+                }])
+            return httpx.Response(200, json=[autosuggest(query)])
+        origin_id = json.loads(call.content)["legs"][0]["legOrigin"]["entityId"]
+        if origin_id == "origin-poz":
+            return httpx.Response(503, json={"error": "temporary"})
+        return httpx.Response(200, json=fixture("explore_country.json"))
+
+    req = request(level="city")
+    req["destination_scope"]["countries"] = [{"query": "Włochy"}]
+    response = await run_explore(req, transport=httpx.MockTransport(handler))
+
+    assert response["status"] == "partial"
+    assert response["results"][0]["destination"]["country"] == {"name": "Włochy"}
+    assert response["partial_failures"][0]["country"] == {"name": "Włochy"}
+    serialized = json.dumps(response)
+    assert "opaque-country-id" not in serialized
+    assert "private-country-entity" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_selected_country_uses_sanitized_provider_choices_without_radar() -> None:
+    radar_calls = 0
+
+    def handler(call: httpx.Request) -> httpx.Response:
+        nonlocal radar_calls
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            if query == "Congo":
+                return httpx.Response(200, json=[
+                    {
+                        "PlaceName": "Congo", "CountryName": "Kongo A",
+                        "CountryId": "opaque-a", "GeoId": "private-a",
+                        "GeoContainerId": "private-container-a",
+                    },
+                    {
+                        "PlaceName": "Congo", "CountryName": "Kongo B",
+                        "CountryId": "123456", "GeoId": "private-b",
+                        "GeoContainerId": "private-container-b",
+                    },
+                ])
+            return httpx.Response(200, json=[autosuggest(query)])
+        radar_calls += 1
+        return httpx.Response(500)
+
+    req = request(level="city")
+    req["destination_scope"]["countries"] = [{"query": "Congo"}]
+    with pytest.raises(FlightsError) as caught:
+        await run_explore(req, transport=httpx.MockTransport(handler))
+
+    assert caught.value.code == "AMBIGUOUS_PLACE"
+    assert caught.value.details["choices"] == [{"name": "Kongo A"}, {"name": "Kongo B"}]
+    assert "private-" not in json.dumps(caught.value.details)
+    assert "123456" not in json.dumps(caught.value.details)
+    assert radar_calls == 0
 
 
 @pytest.mark.asyncio
