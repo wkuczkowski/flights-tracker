@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .coordination import before_provider_request, cached_provider_call, record_bot_challenge
 from .errors import FlightsError, ProviderError
 
 BASE_URL = "https://www.skyscanner.pl"
@@ -44,6 +45,7 @@ class ExploreResult:
     direct_flights_available: bool
     provider_tags: tuple[str, ...]
     observed_at: str | None = None
+    direct_availability_conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class SkyscannerWebProvider:
 
     async def _request(self, method: str, path: str, *, view_id: str | None = None, json: Any = None, deadline: float | None = None) -> Any:
         for attempt in range(self.retries + 1):
+            await before_provider_request()
             try:
                 request = self.client.request(method, path, headers=self._headers(view_id), json=json)
                 if deadline is None:
@@ -118,6 +121,7 @@ class SkyscannerWebProvider:
                 except Exception:
                     pass
                 if response.status_code == 403 or "captcha" in location or reason == "blocked":
+                    await record_bot_challenge()
                     raise ProviderError("BOT_CHALLENGE", "Skyscanner blocked this network session; complete its browser challenge and retry")
             if response.status_code == 429:
                 retry_after = response.headers.get("retry-after")
@@ -135,6 +139,7 @@ class SkyscannerWebProvider:
                 raise ProviderError("PROVIDER_UNAVAILABLE", f"Skyscanner returned HTTP {response.status_code}", retryable=response.status_code >= 500)
             if "html" in content_type or response.text.lstrip().lower().startswith("<!doctype html"):
                 if "captcha" in response.text.lower() or "perimeterx" in response.text.lower():
+                    await record_bot_challenge()
                     raise ProviderError("BOT_CHALLENGE", "Skyscanner returned a browser challenge")
                 raise ProviderError("CONTRACT_CHANGED", "Skyscanner returned HTML instead of JSON")
             try:
@@ -146,7 +151,10 @@ class SkyscannerWebProvider:
     async def autosuggest(self, query: str, *, destination: bool = False) -> list[dict[str, Any]]:
         path = f"/g/autosuggest-search/api/v1/search-flight/{quote(self.culture.market)}/{quote(self.culture.locale)}/{quote(query, safe='')}"
         path += f"?isDestination={'true' if destination else 'false'}&enable_general_search_v2=true&autosuggestExp="
-        data = await self._request("GET", path)
+        data = await cached_provider_call(
+            ("autosuggest", self.culture.market, self.culture.locale, query, destination),
+            lambda: self._request("GET", path),
+        )
         if not isinstance(data, list):
             raise ProviderError("CONTRACT_CHANGED", "Autosuggest response is no longer a list")
         return data
@@ -188,7 +196,11 @@ class SkyscannerWebProvider:
         if not eligible:
             raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved Explore place has no public identity")
         q = _fold(query)
-        if level == "city" and len(query) == 3 and query.isalpha() and query.upper() == query:
+        public_code_query = (
+            (level == "country" and len(query) == 2)
+            or (level == "city" and len(query) in {3, 4})
+        ) and query.isalpha() and query.upper() == query
+        if public_code_query:
             exact = [item for item in eligible if item[1].code == query]
         else:
             exact = [
@@ -446,10 +458,25 @@ def _explore_collection(
             raise ProviderError("CONTRACT_CHANGED", "Radar Explore location has no public continent")
         quotes = content.get("flightQuotes")
         routes = content.get("flightRoutes")
-        if not isinstance(quotes, dict) or not isinstance(routes, dict) or not isinstance(routes.get("directFlightsAvailable"), bool):
-            raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has malformed quotes or routes")
-        cheapest = _explore_price(quotes.get("cheapest"), currency)
-        direct = _explore_price(quotes.get("direct"), currency)
+        if "flightQuotes" in content and not isinstance(quotes, dict):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has malformed quotes")
+        if "flightRoutes" in content and not isinstance(routes, dict):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has malformed routes")
+        cheapest_value = quotes.get("cheapest") if quotes is not None else None
+        direct_value = quotes.get("direct") if quotes is not None else None
+        cheapest = _explore_price(cheapest_value, currency)
+        direct = _explore_price(direct_value, currency)
+        inferred_direct = direct is not None or (
+            isinstance(cheapest_value, dict) and cheapest_value.get("direct") is True
+        )
+        direct_available = inferred_direct
+        direct_conflict = False
+        if routes is not None:
+            route_direct = routes.get("directFlightsAvailable")
+            if not isinstance(route_direct, bool):
+                raise ProviderError("CONTRACT_CHANGED", "Radar Explore routes have no direct availability flag")
+            direct_conflict = inferred_direct and not route_direct
+            direct_available = route_direct or inferred_direct
         locations.append(ExploreResult(
             code=location["skyCode"].upper(),
             name=location["name"],
@@ -457,8 +484,9 @@ def _explore_collection(
             continent_name=continent["name"],
             cheapest_price=cheapest,
             cheapest_direct_price=direct,
-            direct_flights_available=routes["directFlightsAvailable"],
+            direct_flights_available=direct_available,
             provider_tags=tuple(sorted(tags.get(row["id"], []))),
+            direct_availability_conflict=direct_conflict,
         ))
     total = context.get("totalResults", len(results))
     if not isinstance(total, int) or isinstance(total, bool) or total < 0:

@@ -76,7 +76,8 @@ Reguły walidacji:
 - maksymalna liczba originów i pasażerów powinna być jawnie ograniczona;
 - `direct_only` implikuje `max_stops: 0`.
 - filtry godzinowe `depart_after`, `depart_before`, `return_after`, `return_before` przyjmują lokalne `HH:MM` i są stosowane po normalizacji itineraries.
-- `flexible-search` najpierw buduje siatkę `alternative-dates`, bierze `date_candidates` (1-15) najtańszych par i dla każdej robi live `search`; wynik zawiera `date_candidates` oraz `date_pair`/`guide_price` przy ofertach.
+- `flexible-search` najpierw buduje siatkę `alternative-dates`, a następnie wybiera `date_candidates` (1-15, domyślnie 3) par do live `search`; wybór jest deterministycznie zbalansowany między originami (round-robin po posortowanych cenowo kolejkach per-origin), deduplikuje identyczne zapytania i nadal preferuje tańsze pary. Wynik zawiera `date_candidates` oraz `date_pair`/`guide_price` przy ofertach.
+- Workflow providera są serializowane między procesami CLI. Oczekiwanie na globalny lock respektuje deadline; walidacja i inne operacje lokalne nie wymagają locka. W obrębie jednego workflow Autosuggest/resolve korzysta z request-scoped cache i jednego współdzielonego klienta HTTP.
 
 ## Wyjście search
 
@@ -127,7 +128,8 @@ Reguły walidacji:
         "deeplink": "https://example.invalid/redacted"
       }]
     }],
-    "is_self_transfer": false,
+    "is_self_transfer": null,
+    "airport_change": false,
     "sustainability": {
       "is_eco_contender": false,
       "eco_contender_delta_percent": null
@@ -151,6 +153,12 @@ Reguły walidacji:
 
 `booking_options[].total_price` jest autorytatywną ceną kompletnej opcji. Przy `requires_multiple_bookings: true` ceny `booking_items[]` są częściami podróży i nie wolno przedstawiać ich jako pełnej ceny. `agents[]` jest deprecated i zawiera wyłącznie jednoelementowe opcje, których cena reprezentuje całą opcję.
 
+`is_self_transfer` ma trzy stany: `true`, `false` albo `null` (provider nie podał informacji i `transferType` nie pozwala jej wywnioskować). `airport_change` jest niezależnym, trójstanowym wykryciem zmiany lotniska między sąsiednimi segmentami. Segment zachowuje publiczny/display code w `origin`/`destination`, a zweryfikowane jawne pola providerowe w `origin_iata`/`destination_iata`. `carrier.iata` jest ustawiane wyłącznie z jawnego pola IATA; providerowy `alternateId` trafia do `carrier.alternate_code`, nie jest automatycznie nazywany IATA.
+
+Dla zgodności istniejące stringi `origin`/`destination` pozostają w wynikach, ale nowe `origin_place`/`destination_place` rozdzielają `name` od `public_code`. Analogiczne tożsamości są dostępne w query search oraz w `origin_identity`/`destination_identity` alternative-dates. `public_code` jest publicznym kodem zapytania zwróconym przez Autosuggest; kod konkretnego lotniska dla segmentu należy czytać z `origin_iata`/`destination_iata`.
+
+W Explore prawidłowa `cheapest_direct_price` implikuje `direct_flights_available: true`. Jeśli provider jednocześnie zwróci `flightRoutes.directFlightsAvailable: false`, origin option ma `direct_availability_conflict: true`, a odpowiedź zawiera warning. Pozostałe typy i wymagane pola nadal podlegają ścisłej walidacji.
+
 `status` przyjmuje `complete`, `partial` lub `failed`. Użyteczny wynik częściowy ma exit `0` i ostrzeżenia. Awaria wszystkich originów ma `failed` i kod niezerowy. Brak ofert jest poprawną odpowiedzią `complete` z pustym `results`, a nie awarią providera.
 
 ## Błąd
@@ -172,3 +180,25 @@ Reguły walidacji:
 Stabilne kody: `INVALID_ARGUMENT`, `AMBIGUOUS_PLACE`, `BOT_CHALLENGE`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`, `SESSION_EXPIRED`, `PROVIDER_UNAVAILABLE`, `PROVIDER_PROTOCOL_ERROR`, `CONTRACT_CHANGED`, `INTERNAL_ERROR`.
 
 Exit codes: `0` sukces/użyteczny partial, `2` walidacja, `3` wymagany ręczny unlock, `4` provider po wyczerpaniu retry, `5` rate limit/deadline, `6` błąd wewnętrzny/schematu.
+
+Pierwszy `BOT_CHALLENGE` otwiera współdzielony między procesami circuit breaker. Kolejne workflow kończą się fail-fast kodem 3 bez requestu do providera. Po cooldownie tylko zserializowany workflow przechodzi do half-open; ponowny challenge otwiera circuit ponownie. `browser unlock` samo otwiera widoczną przeglądarkę i nie twierdzi, że search działa. Po ręcznym ukończeniu challenge `browser unlock --probe` wykonuje pojedynczy lekki probe; jego sukces ustawia lokalny circuit na half-open i pozostawia użytkownikowi dokładnie jeden kontrolowany retry oryginalnej komendy. Cookies, tokeny i nagłówki przeglądarki nie są kopiowane.
+
+## Doctor
+
+`doctor` nie tworzy domyślnie requestu Radar. Zwraca:
+
+```json
+{
+  "status": "ok",
+  "checks": {"http": "ok", "autosuggest_contract": "ok", "radar": "not_checked"},
+  "search_readiness": {"status": "unknown", "reason": "radar_not_checked"},
+  "circuit_breaker": {
+    "state": "closed",
+    "cooldown_seconds": 900,
+    "remaining_seconds": 0.0,
+    "manual_half_open": false
+  }
+}
+```
+
+Stan `ok` potwierdza tylko wykonane lekkie checki, nie gotowość live search. Przy otwartym/half-open circuit `doctor` nie zużywa kontrolowanego retry, pomija HTTP i zwraca `degraded` oraz bieżący stan circuit breakera.

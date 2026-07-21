@@ -6,17 +6,33 @@ import hashlib
 import json
 import re
 import time
+from functools import wraps
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
+from .coordination import provider_workflow, workflow_client, workflow_deadline
 from .errors import FlightsError, ProviderError
 from .provider import BASE_URL, Culture, ResolvedExplorePlace, SkyscannerWebProvider, decimal_string, place_summary
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _TIME_FILTER_KEYS = ("depart_after", "depart_before", "return_after", "return_before")
+
+
+def _coordinated(validator: Any, default_timeout: float) -> Any:
+    def decorate(function: Any) -> Any:
+        @wraps(function)
+        async def wrapped(req: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            validated = validator(copy.deepcopy(req))
+            timeout = float(validated.get("timeout", kwargs.get("timeout", default_timeout)))
+            async with provider_workflow(time.monotonic() + timeout):
+                return await function(validated, *args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 def parse_date(value: str, field: str) -> date:
@@ -205,6 +221,34 @@ def alternative_sort_key(item: dict[str, Any], *, direct_only: bool = False) -> 
     return amount, item.get("departure_date") or "", str(item.get("origin") or "")
 
 
+def select_balanced_candidates(
+    rows: list[dict[str, Any]], limit: int, *, direct_only: bool = False,
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        origin_key = json.dumps(row.get("origin_place") or row.get("origin"), sort_keys=True)
+        key = (origin_key, str(row.get("departure_date")), str(row.get("return_date")))
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    unique.sort(key=lambda item: alternative_sort_key(item, direct_only=direct_only))
+    by_origin: dict[str, list[dict[str, Any]]] = {}
+    for row in unique:
+        origin_key = json.dumps(row.get("origin_place") or row.get("origin"), sort_keys=True)
+        by_origin.setdefault(origin_key, []).append(row)
+    selected: list[dict[str, Any]] = []
+    while len(selected) < limit:
+        added = False
+        for candidates in by_origin.values():
+            if candidates and len(selected) < limit:
+                selected.append(candidates.pop(0))
+                added = True
+        if not added:
+            break
+    return selected
+
+
 def _origin_request_place(resolved: dict[str, Any], original: dict[str, Any]) -> dict[str, str]:
     iata = resolved.get("IataCode")
     if isinstance(iata, str) and len(iata) == 3:
@@ -212,6 +256,17 @@ def _origin_request_place(resolved: dict[str, Any], original: dict[str, Any]) ->
     if original.get("iata"):
         return {"iata": str(original["iata"]).upper()}
     return {"query": str(original.get("query") or resolved.get("PlaceName") or iata or "")}
+
+
+def _public_search_identity(resolved: dict[str, Any]) -> dict[str, str]:
+    identity: dict[str, str] = {}
+    name = resolved.get("PlaceName")
+    code = resolved.get("IataCode")
+    if isinstance(name, str) and name:
+        identity["name"] = name
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z]{3}", code):
+        identity["public_code"] = code.upper()
+    return identity
 
 
 def _explore_date(value: Any, field: str) -> tuple[dict[str, str], date | None]:
@@ -445,18 +500,24 @@ async def _resolve_explore_origins(
     outcomes: list[dict[str, Any] | FlightsError | None] = [None] * len(values)
     tasks = {asyncio.create_task(resolve(index, value)): index for index, value in enumerate(values)}
     pending = set(tasks)
-    while pending and (remaining := deadline - time.monotonic()) > 0:
-        done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            break
-        for completed in done:
-            index, outcome = await completed
-            outcomes[index] = outcome
-            if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                raise outcome
+    try:
+        while pending and (remaining := deadline - time.monotonic()) > 0:
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
+            for completed in done:
+                index, outcome = await completed
+                outcomes[index] = outcome
+                if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    raise outcome
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     finished = {task for task in pending if task.done()}
     for completed in finished:
         index, outcome = await completed
@@ -473,16 +534,17 @@ async def _resolve_explore_origins(
     ]
 
 
+@_coordinated(validate_explore_request, 60.0)
 async def run_explore(
     req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     req = validate_explore_request(req)
-    deadline = started + float(req.get("timeout", timeout))
+    deadline = workflow_deadline(started + float(req.get("timeout", timeout)))
     culture = Culture(req.get("market", "PL"), req.get("locale", "pl-PL"), req.get("currency", "PLN"))
     level = req["destination_scope"]["level"]
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(25, connect=5), follow_redirects=False, transport=transport) as client:
+    async with workflow_client(transport=transport, timeout=httpx.Timeout(25, connect=5)) as client:
         provider = SkyscannerWebProvider(client, culture=culture)
         await _resolve_explore_filter_queries(req, provider, deadline)
         resolution_budget = min(10.0, max(0.05, (deadline - started) * 0.25))
@@ -540,18 +602,24 @@ async def run_explore(
             if isinstance(origin, dict)
         }
         pending = set(tasks)
-        while pending and (remaining := deadline - time.monotonic()) > 0:
-            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-            if not done:
-                break
-            for completed in done:
-                key, outcome = await completed
-                outcomes[key] = outcome
-                if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    raise outcome
+        try:
+            while pending and (remaining := deadline - time.monotonic()) > 0:
+                done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    break
+                for completed in done:
+                    key, outcome = await completed
+                    outcomes[key] = outcome
+                    if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise outcome
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         finished = {task for task in pending if task.done()}
         for completed in finished:
             key, outcome = await completed
@@ -606,6 +674,7 @@ async def run_explore(
                 "origin": _public_label(original, origins[origin_index]), "state": "quoted",
                 "cheapest_price": cheapest, "cheapest_direct_price": direct,
                 "direct_flights_available": provider_result.direct_flights_available,
+                "direct_availability_conflict": provider_result.direct_availability_conflict,
                 "outbound_date": req["_depart_exact"].isoformat() if req.get("_depart_exact") else None,
                 "return_date": req["_return_exact"].isoformat() if req.get("_return_exact") else None,
                 "nights": nights, "stay_match": stay_match, "observed_at": provider_result.observed_at,
@@ -667,6 +736,15 @@ async def run_explore(
     successful_tasks = len(outcomes) - sum(isinstance(value, FlightsError) for value in outcomes.values())
     status = "failed" if not successful_tasks else ("partial" if failures or incomplete else "complete")
     warnings = ["Indicative prices have no authoritative observation timestamp; observed_at is null"]
+    if any(
+        option.get("direct_availability_conflict")
+        for row in results
+        for option in row.get("origin_options", [])
+        if option.get("state") == "quoted"
+    ):
+        warnings.append(
+            "Provider direct-route availability conflicted with a direct price; direct availability was treated as true"
+        )
     if any(value.get("scope") == "anytime" for value in (req["trip"].get("depart"), req["trip"].get("return")) if isinstance(value, dict)):
         warnings.append("Anytime exploration does not guarantee stay length; stay_match is unknown")
     if incomplete:
@@ -692,6 +770,7 @@ async def run_explore(
     return response
 
 
+@_coordinated(validate_request, 60.0)
 async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
                      transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
     started = time.monotonic()
@@ -699,27 +778,20 @@ async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency:
     timeout = float(req.get("timeout", timeout))
     if timeout <= 0:
         raise FlightsError("INVALID_ARGUMENT", "timeout must be greater than zero")
-    deadline = started + timeout
+    deadline = workflow_deadline(started + timeout)
     culture = Culture(req.get("market", "PL"), req.get("locale", "pl-PL"), req.get("currency", "PLN"))
     timeout_config = httpx.Timeout(25, connect=5)
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=timeout_config, follow_redirects=False, transport=transport) as client:
+    async with workflow_client(transport=transport, timeout=timeout_config) as client:
         provider = SkyscannerWebProvider(client, culture=culture)
         destination_query = req["destination"].get("query") or req["destination"].get("iata")
         try:
             destination = await asyncio.wait_for(provider.resolve_place(destination_query, destination=True), max(0.001, deadline - time.monotonic()))
         except TimeoutError as exc:
             raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving destination", retryable=True) from exc
-        resolve_semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
-
-        async def resolve_origin(value: dict[str, Any]) -> dict[str, Any] | FlightsError:
-            try:
-                async with resolve_semaphore:
-                    return await provider.resolve_place(value.get("query") or value.get("iata"), destination=False)
-            except FlightsError as exc:
-                return exc
-
         try:
-            origin_places = await asyncio.wait_for(asyncio.gather(*(resolve_origin(x) for x in req["origins"])), max(0.001, deadline - time.monotonic()))
+            origin_places = await _resolve_explore_origins(
+                req["origins"], provider, concurrency=concurrency, deadline=deadline,
+            )
         except TimeoutError as exc:
             raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving places", retryable=True) from exc
         semaphore = asyncio.Semaphore(max(1, min(concurrency, 3)))
@@ -761,6 +833,12 @@ async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise ProviderError("PROVIDER_TIMEOUT", "Flight search deadline reached", retryable=True) from exc
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     results: list[dict[str, Any]] = []
     failures = []
@@ -805,7 +883,20 @@ async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency:
         warnings.append(f"Excluded {time_filtered} itineraries that missed departure/return time filters")
     response = {"schema_version": "1.0", "request_id": request_id(), "status": status, "provider": "skyscanner_web", "price_kind": "live", "currency": culture.currency,
                 "searched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "query": {"origins": [(p.get("IataCode") or p.get("PlaceName")) if isinstance(p, dict) else (original.get("iata") or original.get("query")) for p, original in zip(origin_places, req["origins"], strict=True)], "destination": destination.get("IataCode") or destination.get("PlaceName")},
+                "query": {
+                    "origins": [
+                        (p.get("IataCode") or p.get("PlaceName"))
+                        if isinstance(p, dict)
+                        else (original.get("iata") or original.get("query"))
+                        for p, original in zip(origin_places, req["origins"], strict=True)
+                    ],
+                    "origin_places": [
+                        _public_search_identity(place) if isinstance(place, dict) else None
+                        for place in origin_places
+                    ],
+                    "destination": destination.get("IataCode") or destination.get("PlaceName"),
+                    "destination_place": _public_search_identity(destination),
+                },
                 "results": results, "partial_failures": failures, "warnings": warnings,
                 "meta": {"result_count": len(results), "origins_succeeded": succeeded, "origins_failed": len(failures), "polls": polls, "time_filtered": time_filtered, "elapsed_ms": round((time.monotonic() - started) * 1000)}}
     if status == "failed":
@@ -813,6 +904,7 @@ async def run_search(req: dict[str, Any], *, timeout: float = 60.0, concurrency:
     return response
 
 
+@_coordinated(validate_request, 60.0)
 async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, concurrency: int = 2,
                                 transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
     started = time.monotonic()
@@ -820,22 +912,21 @@ async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, c
     timeout = float(req.get("timeout", timeout))
     if timeout <= 0:
         raise FlightsError("INVALID_ARGUMENT", "timeout must be greater than zero")
-    deadline = started + timeout
+    deadline = workflow_deadline(started + timeout)
     culture = Culture(req.get("market", "PL"), req.get("locale", "pl-PL"), req.get("currency", "PLN"))
     direct_only = bool((req.get("filters") or {}).get("direct_only"))
     stay = req.get("stay") or {}
     min_nights = stay.get("min_nights")
     max_nights = stay.get("max_nights")
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(25, connect=5), follow_redirects=False, transport=transport) as client:
+    async with workflow_client(transport=transport, timeout=httpx.Timeout(25, connect=5)) as client:
         provider = SkyscannerWebProvider(client, culture=culture)
         try:
             destination = await asyncio.wait_for(
                 provider.resolve_place(req["destination"].get("iata") or req["destination"].get("query"), destination=True),
                 max(0.001, deadline - time.monotonic()),
             )
-            origins = await asyncio.wait_for(
-                asyncio.gather(*(provider.resolve_place(o.get("iata") or o.get("query")) for o in req["origins"])),
-                max(0.001, deadline - time.monotonic()),
+            origins = await _resolve_explore_origins(
+                req["origins"], provider, concurrency=concurrency, deadline=deadline,
             )
         except TimeoutError as exc:
             raise ProviderError("PROVIDER_TIMEOUT", "Deadline reached while resolving places", retryable=True) from exc
@@ -856,7 +947,46 @@ async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, c
                 )
                 return origin, dates, polls, complete
 
-        outcomes = await asyncio.gather(*(one(origin) for origin in origins), return_exceptions=True)
+        outcomes: list[Any] = [origin if isinstance(origin, FlightsError) else None for origin in origins]
+
+        async def indexed(index: int, origin: dict[str, Any]) -> tuple[int, Any]:
+            try:
+                return index, await one(origin)
+            except FlightsError as exc:
+                return index, exc
+
+        tasks = {
+            asyncio.create_task(indexed(index, origin)): index
+            for index, origin in enumerate(origins)
+            if isinstance(origin, dict)
+        }
+        pending = set(tasks)
+        try:
+            while pending and (remaining := deadline - time.monotonic()) > 0:
+                done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    break
+                for completed in done:
+                    index, outcome = await completed
+                    outcomes[index] = outcome
+                    if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise outcome
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                outcomes[tasks[task]] = ProviderError(
+                    "PROVIDER_TIMEOUT", "Alternative-dates deadline reached", retryable=True
+                )
 
     normalized: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -878,6 +1008,7 @@ async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, c
             row = {
                 "origin": origin_label,
                 "origin_place": origin_place,
+                "origin_identity": _public_search_identity(origin),
                 "departure_date": item.get("departureDate"),
                 "return_date": item.get("returnDate"),
                 "availability": item.get("availability"),
@@ -903,8 +1034,12 @@ async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, c
         "request_id": request_id(),
         "status": status,
         "provider": "skyscanner_web",
-        "origins": [place_summary(o) for o in origins],
+        "origins": [place_summary(o) for o in origins if isinstance(o, dict)],
         "destination": place_summary(destination),
+        "origin_identities": [
+            _public_search_identity(origin) for origin in origins if isinstance(origin, dict)
+        ],
+        "destination_identity": _public_search_identity(destination),
         "results": normalized[:limit],
         "partial_failures": failures,
         "meta": {
@@ -928,13 +1063,14 @@ async def run_alternative_dates(req: dict[str, Any], *, timeout: float = 60.0, c
     return response
 
 
+@_coordinated(validate_request, 120.0)
 async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, concurrency: int = 2,
                               transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
     started = time.monotonic()
     req = validate_request(copy.deepcopy(req))
     if not req.get("_return"):
         raise FlightsError("INVALID_ARGUMENT", "flexible-search requires a round-trip return date")
-    date_candidates = req.get("date_candidates", 5)
+    date_candidates = req.get("date_candidates", 3)
     timeout = float(req.get("timeout", timeout))
     if timeout <= 0:
         raise FlightsError("INVALID_ARGUMENT", "timeout must be greater than zero")
@@ -959,8 +1095,13 @@ async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, co
             "meta": {"elapsed_ms": round((time.monotonic() - started) * 1000), "date_candidates": 0, "searches": 0},
         }
     direct_only = bool((req.get("filters") or {}).get("direct_only"))
-    candidates = (alt.get("_all_results") or alt.get("results") or [])[:date_candidates]
+    candidates = select_balanced_candidates(
+        alt.get("_all_results") or alt.get("results") or [],
+        date_candidates,
+        direct_only=direct_only,
+    )
     searches = 0
+    successful_searches = 0
     live_results: list[dict[str, Any]] = []
     failures = list(alt.get("partial_failures") or [])
     warnings = []
@@ -986,7 +1127,53 @@ async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, co
             except FlightsError as exc:
                 return candidate, exc
 
-    outcomes = await asyncio.gather(*(search_candidate(c) for c in candidates)) if candidates else []
+    tasks = {asyncio.create_task(search_candidate(candidate)): candidate for candidate in candidates}
+    outcomes: list[tuple[dict[str, Any], dict[str, Any] | FlightsError]] = []
+    pending = set(tasks)
+    try:
+        while pending:
+            remaining_time = workflow_deadline(started + timeout) - time.monotonic()
+            if remaining_time <= 0:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for candidate in (tasks[task] for task in pending):
+                    outcomes.append((
+                        candidate,
+                        ProviderError("PROVIDER_TIMEOUT", "Flexible-search deadline reached", retryable=True),
+                    ))
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining_time, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                continue
+            for completed in done:
+                candidate, outcome = await completed
+                if (
+                    isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE"
+                ) or (
+                    isinstance(outcome, dict)
+                    and outcome.get("status") == "failed"
+                    and (outcome.get("error") or {}).get("code") == "BOT_CHALLENGE"
+                ):
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    if isinstance(outcome, FlightsError):
+                        raise outcome
+                    error = outcome.get("error") or {}
+                    raise ProviderError(
+                        "BOT_CHALLENGE",
+                        str(error.get("message") or "Skyscanner returned a browser challenge"),
+                        details=error.get("details") or {},
+                    )
+                outcomes.append((candidate, outcome))
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     for candidate, outcome in outcomes:
         searches += 1
         guide = candidate.get("direct_price") if direct_only else candidate.get("price")
@@ -999,6 +1186,7 @@ async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, co
                 "retryable": outcome.retryable,
             })
             continue
+        successful_searches += 1
         if outcome.get("status") == "failed":
             err = outcome.get("error") or {}
             failures.append({
@@ -1037,7 +1225,9 @@ async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, co
     if not candidates:
         warnings.append("No alternative-date candidates matched stay/direct filters")
     status = "complete"
-    if not live_results and failures and not candidates:
+    if candidates and not successful_searches:
+        status = "failed"
+    elif not live_results and failures and not candidates:
         status = "failed"
     elif failures or alt.get("status") == "partial":
         status = "partial" if live_results or candidates else "failed"
@@ -1091,8 +1281,9 @@ async def run_flexible_search(req: dict[str, Any], *, timeout: float = 120.0, co
 
 async def resolve(query: str, *, destination: bool, market: str, locale: str, currency: str,
                   transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(20, connect=5), follow_redirects=False, transport=transport) as client:
-        place = await SkyscannerWebProvider(client, culture=Culture(market, locale, currency)).resolve_place(query, destination=destination)
+    async with provider_workflow(time.monotonic() + 20):
+        async with workflow_client(transport=transport, timeout=httpx.Timeout(20, connect=5)) as client:
+            place = await SkyscannerWebProvider(client, culture=Culture(market, locale, currency)).resolve_place(query, destination=destination)
     return {"schema_version": "1.0", "status": "complete", "provider": "skyscanner_web", "place": place_summary(place)}
 
 
@@ -1104,12 +1295,26 @@ def normalize_result(raw: dict[str, Any], origin: dict[str, Any], destination: d
     amount = decimal_string(price.get("raw", price.get("amount")))
     booking_options = _booking_options(raw, currency)
     agents = _agents(raw, currency)
+    if "isSelfTransfer" in raw and not isinstance(raw["isSelfTransfer"], bool):
+        raise ProviderError("PROVIDER_PROTOCOL_ERROR", "isSelfTransfer must be boolean when present")
+    transfer_types = {
+        str(value).upper()
+        for value in [raw.get("transferType"), *(option.get("transfer_type") for option in booking_options)]
+        if value is not None
+    }
+    self_transfer = raw.get("isSelfTransfer") if "isSelfTransfer" in raw else (
+        True if any("SELF_TRANSFER" in value for value in transfer_types) else None
+    )
+    airport_change = _itinerary_airport_change(legs)
     stable = {"origin": origin.get("IataCode") or origin.get("GeoId"), "destination": destination.get("IataCode") or destination.get("GeoId"), "price": amount,
               "legs": [[l.get("departure_local"), l.get("arrival_local"), [(s.get("flight_number"), s.get("origin"), s.get("destination"), s["carrier"].get("iata"), s["carrier"].get("name")) for s in l["segments"]]] for l in legs],
               "agents": [(agent.get("name"), agent["price"]["amount"]) for agent in agents]}
     result = {"id": hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:24], "origin": origin.get("IataCode") or origin.get("PlaceName"),
               "destination": destination.get("IataCode") or destination.get("PlaceName"), "price": {"amount": amount, "currency": currency}, "legs": legs,
-              "booking_options": booking_options, "agents": agents, "is_self_transfer": bool(raw.get("isSelfTransfer", False)),
+              "origin_place": _public_search_identity(origin),
+              "destination_place": _public_search_identity(destination),
+              "booking_options": booking_options, "agents": agents, "is_self_transfer": self_transfer,
+              "airport_change": airport_change,
               "sustainability": {"is_eco_contender": bool(raw.get("eco")), "eco_contender_delta_percent": (raw.get("eco") or {}).get("ecoContenderDelta")}}
     return result
 
@@ -1126,9 +1331,19 @@ def _normalize_leg(leg: dict[str, Any]) -> dict[str, Any]:
 def _normalize_segment(segment: dict[str, Any]) -> dict[str, Any]:
     carrier = segment.get("marketingCarrier") or segment.get("carrier") or {}
     flight = segment.get("flightNumber") or segment.get("flightNumberDisplay")
+    if not isinstance(carrier, dict):
+        raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Segment carrier must be an object")
+    raw_iata = carrier.get("iata")
+    iata = raw_iata.upper() if isinstance(raw_iata, str) and re.fullmatch(r"[A-Za-z0-9]{2}", raw_iata) else None
+    alternate = carrier.get("alternateId")
     return {"flight_number": str(flight) if flight is not None else None,
-            "carrier": {"id": carrier.get("id"), "name": carrier.get("name"), "iata": carrier.get("alternateId") or carrier.get("iata")},
+            "carrier": {
+                "id": carrier.get("id"), "name": carrier.get("name"), "iata": iata,
+                "alternate_code": str(alternate) if alternate is not None else None,
+            },
             "origin": _place_code(segment.get("origin")), "destination": _place_code(segment.get("destination")),
+            "origin_iata": _place_iata(segment.get("origin")),
+            "destination_iata": _place_iata(segment.get("destination")),
             "departure_local": _local_time(segment.get("departure")), "arrival_local": _local_time(segment.get("arrival"))}
 
 
@@ -1147,6 +1362,32 @@ def _place_code(value: Any) -> str | None:
     if isinstance(value, dict):
         return value.get("displayCode") or value.get("iata") or value.get("id")
     return value if isinstance(value, str) else None
+
+
+def _place_iata(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("iata")
+    return raw.upper() if isinstance(raw, str) and re.fullmatch(r"[A-Za-z]{3}", raw) else None
+
+
+def _itinerary_airport_change(legs: list[dict[str, Any]]) -> bool | None:
+    if not legs:
+        return None
+    known = True
+    for leg in legs:
+        segments = leg.get("segments") or []
+        if not segments:
+            known = False
+            continue
+        for previous, following in zip(segments, segments[1:]):
+            arrival = previous.get("destination_iata") or previous.get("destination")
+            departure = following.get("origin_iata") or following.get("origin")
+            if not arrival or not departure:
+                known = False
+            elif str(arrival).upper() != str(departure).upper():
+                return True
+    return False if known else None
 
 
 def _agents(raw: dict[str, Any], currency: str) -> list[dict[str, Any]]:

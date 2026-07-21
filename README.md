@@ -7,11 +7,11 @@ uv sync
 uv run flights places resolve WAW
 uv run flights explore --request explore.json
 uv run flights search --origin WAW --origin POZ --destination Rzym --depart 2026-09-10 --return 2026-09-17 --limit 10
-uv run flights flexible-search --origin WAW --origin GDN --destination Rzym --depart 2026-09-25 --return 2026-09-29 --direct --min-nights 3 --max-nights 5 --depart-before 12:00 --return-after 17:00 --date-candidates 5
+uv run flights flexible-search --origin WAW --origin GDN --destination Rzym --depart 2026-09-25 --return 2026-09-29 --direct --min-nights 3 --max-nights 5 --depart-before 12:00 --return-after 17:00 --date-candidates 3
 uv run flights doctor
 ```
 
-CLI jest zaimplementowane w `src/flights_tracker/`; komendy `places resolve`, `explore`, `search`, `alternative-dates`, `flexible-search`, `doctor` i `browser unlock` są dostępne po `uv sync`. `explore` służy do dwuetapowego odkrywania krajów, a następnie miast; nie ocenia samodzielnie, co jest ciepłe albo stanowi okazję. `doctor` sprawdza DNS/TLS/HTTP i kontrakt Autosuggest, ale celowo nie tworzy kosztownego wyszukiwania Radar.
+CLI jest zaimplementowane w `src/flights_tracker/`; komendy `places resolve`, `explore`, `search`, `alternative-dates`, `flexible-search`, `doctor` i `browser unlock` są dostępne po `uv sync`. `explore` służy do dwuetapowego odkrywania krajów, a następnie miast; nie ocenia samodzielnie, co jest ciepłe albo stanowi okazję. `doctor` sprawdza DNS/TLS/HTTP i kontrakt Autosuggest, ale celowo nie tworzy kosztownego wyszukiwania Radar, dlatego raportuje `search_readiness.status: unknown`.
 
 Preferowane wejście agenta:
 
@@ -24,6 +24,8 @@ uv run flights explore --request - < explore.json
 
 ```bash
 uv run flights browser unlock --profile ~/.local/share/flights-browser --json
-# ukończ weryfikację w widocznym oknie, następnie:
-uv run flights doctor --json
+# ukończ weryfikację w widocznym oknie, następnie włącz jeden kontrolowany retry:
+uv run flights browser unlock --profile ~/.local/share/flights-browser --probe --json
 ```
+
+Workflow providera są serializowane między procesami. Pierwszy `BOT_CHALLENGE` otwiera współdzielony cooldown/circuit breaker, więc kolejne komendy kończą się fail-fast bez dodatkowych requestów. `--probe` nie potwierdza działania Radar i nie kopiuje żadnego stanu przeglądarki; jedynie przełącza lokalny circuit do half-open przed pojedynczym retry.

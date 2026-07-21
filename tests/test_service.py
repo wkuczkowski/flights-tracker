@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,7 +11,20 @@ import pytest
 from flights_tracker.errors import FlightsError
 from flights_tracker.cli import dispatch, main, parser
 from flights_tracker.provider import ProviderError, SkyscannerWebProvider, _context, _results
-from flights_tracker.service import _agents, _booking_options, alt_price, alternative_sort_key, matches_time_filters, normalize_result, run_flexible_search, run_search, validate_request
+from flights_tracker.coordination import circuit_status, open_circuit
+from flights_tracker.service import (
+    _agents,
+    _booking_options,
+    alt_price,
+    alternative_sort_key,
+    matches_time_filters,
+    normalize_result,
+    run_alternative_dates,
+    run_flexible_search,
+    run_search,
+    select_balanced_candidates,
+    validate_request,
+)
 
 
 def future(days: int) -> str:
@@ -153,6 +167,47 @@ def test_single_item_booking_option_remains_in_deprecated_agents() -> None:
     normalized = normalize_result(raw, {"IataCode": "WAW"}, {"IataCode": "ROM"}, "PLN")
     assert normalized["agents"][0]["price"]["amount"] == "10.00"
     assert normalized["booking_options"][0]["total_price"]["amount"] == "10.00"
+    assert normalized["is_self_transfer"] is None
+    assert normalized["airport_change"] is None
+
+
+def test_airport_change_and_transfer_type_preserve_unknown_self_transfer() -> None:
+    raw = {
+        "price": {"raw": 10},
+        "legs": [{
+            "segments": [
+                {
+                    "origin": {"displayCode": "WAW", "iata": "WAW"},
+                    "destination": {"displayCode": "LHR", "iata": "LHR"},
+                    "marketingCarrier": {"id": "carrier", "alternateId": "W6"},
+                },
+                {
+                    "origin": {"displayCode": "LGW", "iata": "LGW"},
+                    "destination": {"displayCode": "FCO", "iata": "FCO"},
+                    "marketingCarrier": {"id": "carrier", "alternateId": "W6"},
+                },
+            ]
+        }],
+    }
+    normalized = normalize_result(raw, {"IataCode": "WAW"}, {"IataCode": "ROM"}, "PLN")
+    carrier = normalized["legs"][0]["segments"][0]["carrier"]
+
+    assert normalized["airport_change"] is True
+    assert normalized["is_self_transfer"] is None
+    assert carrier["iata"] is None
+    assert carrier["alternate_code"] == "W6"
+
+    self_transfer = {
+        **raw,
+        "pricingOptions": [{
+            "price": {"raw": 10},
+            "transferType": "SELF_TRANSFER",
+            "items": [{"price": {"raw": 10}}],
+        }],
+    }
+    assert normalize_result(
+        self_transfer, {"IataCode": "WAW"}, {"IataCode": "ROM"}, "PLN"
+    )["is_self_transfer"] is True
 
 
 def test_single_item_without_authoritative_option_total_is_protocol_error() -> None:
@@ -292,6 +347,115 @@ async def test_flexible_search_uses_top_date_candidates(monkeypatch: pytest.Monk
     assert response["meta"]["searches"] == 2
 
 
+def test_balanced_candidate_selection_keeps_multiple_origins() -> None:
+    rows = [
+        {
+            "origin": "WAW",
+            "origin_place": {"iata": "WAW"},
+            "departure_date": future(40 + index),
+            "return_date": future(44 + index),
+            "price": {"amount": f"{100 + index}.00"},
+        }
+        for index in range(3)
+    ]
+    rows.extend([
+        {
+            "origin": "GDN",
+            "origin_place": {"iata": "GDN"},
+            "departure_date": future(40),
+            "return_date": future(44),
+            "price": {"amount": "500.00"},
+        },
+        {
+            "origin": "POZ",
+            "origin_place": {"iata": "POZ"},
+            "departure_date": future(40),
+            "return_date": future(44),
+            "price": {"amount": "600.00"},
+        },
+    ])
+
+    selected = select_balanced_candidates(rows, 3)
+
+    assert [row["origin"] for row in selected] == ["WAW", "GDN", "POZ"]
+
+
+@pytest.mark.asyncio
+async def test_alternative_dates_bot_cancels_queued_provider_work() -> None:
+    radar_calls = 0
+
+    def handler(call: httpx.Request) -> httpx.Response:
+        nonlocal radar_calls
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=[{
+                "PlaceName": query,
+                "IataCode": query,
+                "GeoId": query,
+                "CountryId": "PL",
+            }])
+        radar_calls += 1
+        return httpx.Response(403, json={"reason": "blocked"})
+
+    req = request()
+    req["origins"].append({"iata": "GDN"})
+    with pytest.raises(FlightsError) as caught:
+        await run_alternative_dates(
+            req, concurrency=1, transport=httpx.MockTransport(handler)
+        )
+    assert caught.value.code == "BOT_CHALLENGE"
+    assert radar_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_flexible_search_bot_cancels_pending_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = asyncio.Event()
+
+    async def fake_alt(req, **kwargs):
+        return {
+            "status": "complete",
+            "partial_failures": [],
+            "meta": {"polls": 0},
+            "_all_results": [
+                {
+                    "origin": origin,
+                    "origin_place": {"iata": origin},
+                    "departure_date": future(40),
+                    "return_date": future(44),
+                    "price": {"amount": amount},
+                    "direct_price": {"amount": amount},
+                }
+                for origin, amount in (("WAW", "100.00"), ("GDN", "200.00"))
+            ],
+        }
+
+    calls = 0
+
+    async def fake_search(req, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ProviderError("BOT_CHALLENGE", "blocked")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr("flights_tracker.service.run_alternative_dates", fake_alt)
+    monkeypatch.setattr("flights_tracker.service.run_search", fake_search)
+    req = request()
+    req["date_candidates"] = 2
+
+    with pytest.raises(FlightsError) as caught:
+        await run_flexible_search(req, concurrency=2)
+
+    assert caught.value.code == "BOT_CHALLENGE"
+    assert cancelled.is_set()
+
+
 def test_deep_radar_contract_validation() -> None:
     with pytest.raises(ProviderError):
         _context({"context": {"status": "incomplete"}})
@@ -320,3 +484,54 @@ async def test_browser_unlock_is_headed_and_persistent(monkeypatch: pytest.Monke
     output = await dispatch(parser().parse_args(["browser", "unlock", "--json"]))
     assert "--headed" in seen and "--persistent" in seen
     assert output["status"] == "human_action_required"
+
+
+@pytest.mark.asyncio
+async def test_browser_unlock_probe_only_enables_controlled_half_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def autosuggest(self, query):
+            return [{"PlaceName": "Warszawa"}]
+
+    await open_circuit()
+    monkeypatch.setattr("flights_tracker.cli.shutil.which", lambda _: "/bin/playwright-cli")
+    monkeypatch.setattr("flights_tracker.cli.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("flights_tracker.cli.SkyscannerWebProvider", FakeProvider)
+    output = await dispatch(parser().parse_args(["browser", "unlock", "--probe", "--json"]))
+
+    assert output["probe"] == "ok"
+    assert output["search_readiness"]["status"] == "unknown"
+    assert output["circuit_breaker"]["state"] == "half_open"
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_unknown_search_readiness_and_circuit_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def autosuggest(self, query):
+            return [{"PlaceName": "Warszawa"}]
+
+    monkeypatch.setattr("flights_tracker.cli.SkyscannerWebProvider", FakeProvider)
+    output = await dispatch(parser().parse_args(["doctor", "--json"]))
+    assert output["status"] == "ok"
+    assert output["checks"]["radar"] == "not_checked"
+    assert output["search_readiness"] == {
+        "status": "unknown",
+        "reason": "radar_not_checked",
+    }
+    assert output["circuit_breaker"]["state"] == "closed"
+
+    await open_circuit()
+    blocked = await dispatch(parser().parse_args(["doctor", "--json"]))
+    assert blocked["status"] == "degraded"
+    assert blocked["checks"]["http"] == "not_checked"
+    assert blocked["circuit_breaker"]["state"] == "open"
+    assert (await circuit_status())["state"] == "open"

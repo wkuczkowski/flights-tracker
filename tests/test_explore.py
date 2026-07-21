@@ -14,6 +14,7 @@ from flights_tracker.errors import FlightsError, ProviderError
 from flights_tracker.provider import (
     ExploreResult,
     ExploreSnapshot,
+    SkyscannerWebProvider,
     _explore_collection,
     _public_explore_identity,
 )
@@ -258,6 +259,65 @@ def test_provider_contract_fixture_is_sanitized_and_strict() -> None:
     assert "private-continent" not in repr(snapshot.results)
 
 
+def test_provider_contract_allows_omitted_quotes_and_routes() -> None:
+    payload = fixture("explore_everywhere.json")
+    payload["everywhereDestination"]["results"][0]["content"].pop("flightRoutes")
+    payload["everywhereDestination"]["results"][1]["content"].pop("flightQuotes")
+
+    snapshot = _explore_collection(payload, expected="everywhereDestination")
+
+    assert snapshot.results[0].cheapest_price == {"amount": "259.00", "currency": "PLN"}
+    assert snapshot.results[0].direct_flights_available is True
+    assert snapshot.results[1].cheapest_price is None
+    assert snapshot.results[1].cheapest_direct_price is None
+    assert snapshot.results[1].direct_flights_available is False
+
+    without_both = fixture("explore_everywhere.json")
+    without_both["everywhereDestination"]["results"][0]["content"].pop("flightQuotes")
+    without_both["everywhereDestination"]["results"][0]["content"].pop("flightRoutes")
+    result = _explore_collection(without_both, expected="everywhereDestination").results[0]
+    assert result.cheapest_price is None and result.direct_flights_available is False
+
+
+def test_direct_price_overrides_conflicting_route_availability_with_warning_state() -> None:
+    payload = fixture("explore_everywhere.json")
+    content = payload["everywhereDestination"]["results"][0]["content"]
+    content["flightRoutes"]["directFlightsAvailable"] = False
+
+    result = _explore_collection(payload, expected="everywhereDestination").results[0]
+
+    assert result.cheapest_direct_price is not None
+    assert result.direct_flights_available is True
+    assert result.direct_availability_conflict is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["ES", "GR", "HR", "PT"])
+async def test_country_public_code_exact_matches_provider_country_identity(code: str) -> None:
+    choices = [
+        {
+            "PlaceName": "Other",
+            "CountryName": "Other",
+            "CountryId": "ZZ",
+            "GeoId": "other",
+        },
+        {
+            "PlaceName": f"Country {code}",
+            "CountryName": f"Country {code}",
+            "CountryId": code,
+            "GeoId": f"country-{code.lower()}",
+        },
+    ]
+    async with httpx.AsyncClient(
+        base_url="https://www.skyscanner.pl",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=choices)),
+    ) as client:
+        resolved = await SkyscannerWebProvider(client).resolve_explore_place(code, level="country")
+
+    assert resolved.public.code == code
+    assert resolved.entity_id == f"country-{code.lower()}"
+
+
 @pytest.mark.parametrize("mutation", [
     lambda data: data["everywhereDestination"].pop("context"),
     lambda data: data["everywhereDestination"].pop("features"),
@@ -266,6 +326,8 @@ def test_provider_contract_fixture_is_sanitized_and_strict() -> None:
     lambda data: data["everywhereDestination"]["results"][0].update(type="MYSTERY"),
     lambda data: data["everywhereDestination"]["results"][0]["content"]["location"].update(type="Region"),
     lambda data: data["everywhereDestination"]["buckets"][0].update(category="MYSTERY"),
+    lambda data: data["everywhereDestination"]["results"][0]["content"].update(flightQuotes=None),
+    lambda data: data["everywhereDestination"]["results"][0]["content"].update(flightRoutes=None),
     lambda data: data["everywhereDestination"]["results"][0]["content"]["flightQuotes"]["cheapest"].pop("rawPrice"),
     lambda data: data["everywhereDestination"]["results"][0]["content"]["flightRoutes"].update(directFlightsAvailable="yes"),
 ])
@@ -307,6 +369,25 @@ async def test_filters_run_before_limit_and_direct_only_uses_direct_price() -> N
     assert response["meta"]["total_candidates"] == 1
     assert response["meta"]["returned_candidates"] == 1
     assert response["meta"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_explore_surfaces_direct_availability_conflict_warning() -> None:
+    def handler(call: httpx.Request) -> httpx.Response:
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=[autosuggest(query)])
+        payload = fixture("explore_everywhere.json")
+        content = payload["everywhereDestination"]["results"][0]["content"]
+        content["flightRoutes"]["directFlightsAvailable"] = False
+        return httpx.Response(200, json=payload)
+
+    response = await run_explore(request(), transport=httpx.MockTransport(handler))
+
+    italy = next(row for row in response["results"] if row["destination"]["code"] == "IT")
+    assert italy["origin_options"][0]["direct_flights_available"] is True
+    assert italy["origin_options"][0]["direct_availability_conflict"] is True
+    assert any("conflicted" in warning for warning in response["warnings"])
 
 
 @pytest.mark.asyncio

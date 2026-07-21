@@ -142,7 +142,7 @@ flights flexible-search \
   --depart 2026-09-25 --return 2026-09-29 \
   --adults 1 --market PL --locale pl-PL --currency PLN \
   --direct --min-nights 3 --max-nights 5 \
-  --date-candidates 5 \
+  --date-candidates 3 \
   --depart-before 12:00 --return-after 17:00 \
   --limit 20 --timeout 120 --json
 ```
@@ -150,7 +150,7 @@ flights flexible-search \
 This command:
 
 1. builds an alternative-dates grid
-2. takes the cheapest `--date-candidates` pairs
+2. takes a price-aware, per-origin balanced set of `--date-candidates` pairs (default 3)
 3. runs live `search` for each pair
 4. returns live itineraries plus `date_candidates` and per-result `date_pair` / `guide_price`
 
@@ -178,13 +178,19 @@ Interpret exit codes as follows:
 - `5`: rate limit or deadline exhausted.
 - `6`: internal, schema, or contract error.
 
-On exit `3` or JSON error `BOT_CHALLENGE`, first open the persistent visible browser:
+On exit `3` or JSON error `BOT_CHALLENGE`, stop all provider work. The shared circuit breaker makes later CLI processes fail fast without sending more provider requests. First open the persistent visible browser:
 
 ```bash
 flights browser unlock
 ```
 
-Then ask the user to complete the challenge in that browser. After the user confirms completion, rerun the original command once and report another challenge instead of looping. Never automate CAPTCHA solving or print browser state and cookies.
+Then ask the user to complete the challenge in that browser. After the user confirms completion, enable one controlled half-open attempt with:
+
+```bash
+flights browser unlock --probe --json
+```
+
+An `ok` probe does not prove Radar/search readiness; it only permits one controlled retry. Rerun the original command once and report another challenge instead of looping. Never automate CAPTCHA solving, copy browser cookies/headers/tokens, or print browser state and cookies.
 
 Use the diagnostic command when access or configuration is uncertain:
 
@@ -192,6 +198,8 @@ Use the diagnostic command when access or configuration is uncertain:
 flights doctor --json
 ```
 
-Preserve the user's dates, passengers, cabin, filters, and locale across retries. Summarize the best results with total price, origin, airports, times, stops, carriers, and any self-transfer or partial-result warnings.
+`doctor` intentionally leaves `search_readiness.status` as `unknown` when Radar is `not_checked`. It also reports the shared circuit-breaker state and skips HTTP while the circuit is open or half-open, preserving the controlled retry.
+
+Preserve the user's dates, passengers, cabin, filters, and locale across retries. Summarize the best results with total price, origin, airports, times, stops, carriers, airport-change status, and any self-transfer or partial-result warnings. Treat `is_self_transfer: null` and `airport_change: null` as unknown, not false. Treat `carrier.alternate_code` as provider display data, not verified IATA.
 
 For live results, use `booking_options[].total_price` as the complete price. When `requires_multiple_bookings` is true, nested `booking_items[].price` values are components and must not be compared with complete trips. Treat legacy `agents[]` as deprecated.

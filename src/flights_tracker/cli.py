@@ -13,6 +13,13 @@ from typing import Any
 import httpx
 
 from . import __version__
+from .coordination import (
+    allow_manual_half_open,
+    circuit_status,
+    open_circuit,
+    provider_workflow,
+    workflow_client,
+)
 from .errors import FlightsError
 from .provider import BASE_URL, Culture, SkyscannerWebProvider
 from .service import (
@@ -88,7 +95,7 @@ def _alt_dates_args(p: argparse.ArgumentParser) -> None:
 
 def _flexible_args(p: argparse.ArgumentParser) -> None:
     _alt_dates_args(p)
-    p.add_argument("--date-candidates", type=int, default=5, help="How many alternative-date pairs to search live")
+    p.add_argument("--date-candidates", type=int, default=3, help="How many alternative-date pairs to search live")
     # Flexible search often needs a longer overall budget.
     for action in p._actions:
         if action.dest == "timeout":
@@ -189,9 +196,52 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return response
     if args.command == "doctor":
         started = time.monotonic()
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(15, connect=5), follow_redirects=False) as client:
-            data = await SkyscannerWebProvider(client, culture=Culture(args.market, args.locale, args.currency), retries=0).autosuggest("Warszawa")
-        return {"schema_version": "1.0", "status": "ok", "provider": "skyscanner_web", "checks": {"dns": "ok", "tls": "ok", "http": "ok", "autosuggest_contract": "ok", "radar": "not_checked", "candidate_count": len(data)}, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        circuit = await circuit_status()
+        checks: dict[str, Any] = {
+            "dns": "not_checked",
+            "tls": "not_checked",
+            "http": "not_checked",
+            "autosuggest_contract": "not_checked",
+            "radar": "not_checked",
+        }
+        status = "degraded" if circuit["state"] != "closed" else "ok"
+        if circuit["state"] == "closed":
+            try:
+                async with provider_workflow(started + 15):
+                    async with workflow_client(
+                        transport=None, timeout=httpx.Timeout(15, connect=5)
+                    ) as client:
+                        data = await SkyscannerWebProvider(
+                            client,
+                            culture=Culture(args.market, args.locale, args.currency),
+                            retries=0,
+                        ).autosuggest("Warszawa")
+                checks.update({
+                    "dns": "ok",
+                    "tls": "ok",
+                    "http": "ok",
+                    "autosuggest_contract": "ok",
+                    "candidate_count": len(data),
+                })
+            except FlightsError as exc:
+                if exc.code != "BOT_CHALLENGE":
+                    raise
+                status = "degraded"
+                checks["http"] = "BOT_CHALLENGE"
+                checks["autosuggest_contract"] = "not_checked"
+                circuit = await circuit_status()
+        return {
+            "schema_version": "1.0",
+            "status": status,
+            "provider": "skyscanner_web",
+            "checks": checks,
+            "search_readiness": {
+                "status": "unknown",
+                "reason": "radar_not_checked",
+            },
+            "circuit_breaker": circuit,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
     if args.command == "browser":
         executable = shutil.which("playwright-cli")
         if not executable:
@@ -208,9 +258,28 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 async with httpx.AsyncClient(base_url=BASE_URL, timeout=10, follow_redirects=False) as client:
                     await SkyscannerWebProvider(client, retries=0).autosuggest("Warszawa")
                 probe = "ok"
+                await allow_manual_half_open()
             except FlightsError as exc:
                 probe = exc.code
-        return {"schema_version": "1.0", "status": "human_action_required", "provider": "skyscanner_web", "probe": probe, "action": {"code": "COMPLETE_BROWSER_CHALLENGE", "message": "Complete any verification in the opened headed browser, then run 'flights doctor --json' and retry"}}
+                if exc.code == "BOT_CHALLENGE":
+                    await open_circuit()
+        circuit = await circuit_status()
+        return {
+            "schema_version": "1.0",
+            "status": "human_action_required",
+            "provider": "skyscanner_web",
+            "probe": probe,
+            "search_readiness": {"status": "unknown", "reason": "radar_not_checked"},
+            "circuit_breaker": circuit,
+            "action": {
+                "code": "COMPLETE_BROWSER_CHALLENGE",
+                "message": (
+                    "Complete any verification in the opened headed browser. Then run "
+                    "'flights browser unlock --probe --json'; if it enables half-open, retry "
+                    "the original provider command once"
+                ),
+            },
+        }
     raise FlightsError("INVALID_ARGUMENT", "Unknown command")
 
 
