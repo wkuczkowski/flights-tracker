@@ -348,6 +348,43 @@ async def test_ambiguous_text_destination_filter_propagates_choices_without_rada
 
 
 @pytest.mark.asyncio
+async def test_fuzzy_destination_filter_does_not_silently_choose_first_suggestion() -> None:
+    radar_calls = 0
+
+    def handler(call: httpx.Request) -> httpx.Response:
+        nonlocal radar_calls
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            if query == "warm":
+                return httpx.Response(200, json=[
+                    {
+                        "PlaceName": "Włochy", "CountryName": "Włochy",
+                        "CountryId": "IT", "GeoId": "private-it",
+                    },
+                    {
+                        "PlaceName": "Hiszpania", "CountryName": "Hiszpania",
+                        "CountryId": "ES", "GeoId": "private-es",
+                    },
+                ])
+            return httpx.Response(200, json=[autosuggest(query)])
+        radar_calls += 1
+        return httpx.Response(500)
+
+    req = request()
+    req["filters"] = {"direct_only": False, "include_destinations": [{"query": "warm"}]}
+    with pytest.raises(FlightsError) as caught:
+        await run_explore(req, transport=httpx.MockTransport(handler))
+
+    assert caught.value.code == "AMBIGUOUS_PLACE"
+    assert caught.value.details["choices"] == [
+        {"code": "IT", "name": "Włochy"},
+        {"code": "ES", "name": "Hiszpania"},
+    ]
+    assert "private-" not in json.dumps(caught.value.details)
+    assert radar_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_city_expansion_adds_selected_country_public_identity() -> None:
     response = await run_explore(request(level="city"), transport=explore_transport("city"))
     milan = response["results"][0]

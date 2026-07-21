@@ -176,23 +176,41 @@ class SkyscannerWebProvider:
     async def resolve_explore_place(self, query: str, *, level: str) -> ResolvedExplorePlace:
         if level not in {"country", "city"}:
             raise FlightsError("INVALID_ARGUMENT", "Explore place level must be country or city")
-        try:
-            raw = await self.resolve_place(query, destination=True)
-        except FlightsError as exc:
-            if exc.code != "AMBIGUOUS_PLACE":
-                raise
-            choices = [
-                identity.as_dict()
-                for choice in exc.details.get("choices", [])
-                if isinstance(choice, dict)
-                if (identity := _public_explore_identity(choice, level=level)) is not None
-            ]
-            raise FlightsError(
-                exc.code, exc.message, retryable=exc.retryable, details={"choices": choices}
-            ) from None
-        identity = _public_explore_identity(raw, level=level)
-        if identity is None:
+        choices = await self.autosuggest(query, destination=True)
+        if not choices:
+            raise FlightsError("INVALID_ARGUMENT", f"No place found for {query!r}")
+        eligible = [
+            (choice, identity)
+            for choice in choices
+            if isinstance(choice, dict) and choice.get("GeoId")
+            if (identity := _public_explore_identity(choice, level=level)) is not None
+        ]
+        if not eligible:
             raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Resolved Explore place has no public identity")
+        q = _fold(query)
+        if level == "city" and len(query) == 3 and query.isalpha() and query.upper() == query:
+            exact = [item for item in eligible if item[1].code == query]
+        else:
+            exact = [
+                item for item in eligible
+                if q in {
+                    _fold(str(item[0].get("PlaceName", ""))),
+                    _fold(str(item[0].get("CountryName", ""))),
+                }
+            ]
+        candidates = exact or eligible
+        distinct: dict[tuple[str, str], tuple[dict[str, Any], PublicPlaceIdentity]] = {}
+        for candidate in candidates:
+            identity = candidate[1]
+            key = ("code", identity.code) if identity.code else ("name", _fold(identity.name))
+            distinct.setdefault(key, candidate)
+        if len(distinct) > 1:
+            raise FlightsError(
+                "AMBIGUOUS_PLACE",
+                f"Place {query!r} is ambiguous",
+                details={"choices": [identity.as_dict() for _, identity in list(distinct.values())[:10]]},
+            )
+        raw, identity = next(iter(distinct.values()))
         return ResolvedExplorePlace(entity_id=str(raw["GeoId"]), public=identity)
 
     async def search_one(self, origin: dict[str, Any], destination: dict[str, Any], *, depart: date,
