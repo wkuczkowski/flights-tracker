@@ -71,23 +71,48 @@ def test_provider_workflows_are_serialized_between_processes(tmp_path: Path) -> 
 
 
 def test_workflow_lock_is_released_after_process_crash(tmp_path: Path) -> None:
+    # Avoid Queue around os._exit: fork + Queue feeder locks can deadlock a
+    # survivor that already holds the workflow flock, hanging the pytest process.
     context = multiprocessing.get_context("fork")
-    output = context.Queue()
     acquired = context.Event()
+    survivor_done = context.Event()
     state_directory = str(tmp_path / "shared")
-    crashed = context.Process(
-        target=_hold_workflow,
-        args=(state_directory, "crashed", 0.0, output, acquired, True),
-    )
+
+    def crash_holder() -> None:
+        os.environ["FLIGHTS_TRACKER_STATE_DIR"] = state_directory
+
+        async def run() -> None:
+            async with provider_workflow(time.monotonic() + 5):
+                acquired.set()
+                os._exit(0)
+
+        asyncio.run(run())
+
+    def survivor_holder() -> None:
+        os.environ["FLIGHTS_TRACKER_STATE_DIR"] = state_directory
+
+        async def run() -> None:
+            async with provider_workflow(time.monotonic() + 5):
+                survivor_done.set()
+
+        asyncio.run(run())
+
+    crashed = context.Process(target=crash_holder)
     crashed.start()
     assert acquired.wait(timeout=2)
     crashed.join(timeout=2)
-    survivor = context.Process(
-        target=_hold_workflow, args=(state_directory, "survivor", 0.0, output)
-    )
+    assert crashed.exitcode == 0
+
+    survivor = context.Process(target=survivor_holder)
     survivor.start()
-    survivor.join(timeout=2)
-    assert survivor.exitcode == 0
+    try:
+        assert survivor_done.wait(timeout=2)
+        survivor.join(timeout=2)
+        assert survivor.exitcode == 0
+    finally:
+        if survivor.is_alive():
+            survivor.kill()
+            survivor.join(timeout=1)
 
 
 def test_workflow_lock_wait_respects_deadline(tmp_path: Path) -> None:
