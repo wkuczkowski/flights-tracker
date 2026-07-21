@@ -7,6 +7,7 @@
 - JSON ma `schema_version`; nowe pola mogą być dodawane kompatybilnie.
 - kwoty są decimal-string, nie `float`; daty są `YYYY-MM-DD`. Czasy lotów są lokalne dla lotniska, bo provider nie zwraca offsetów; pole offset/timezone pozostaje `null`, dopóki autorytatywny resolver stref nie wzbogaci wyniku.
 - `--request -` jest preferowany dla Agenta, bo omija quoting shella.
+- `request_budget` (1–200) opcjonalnie ogranicza liczbę requestów do providera rozpoczętych przez cały workflow. Domyślne limity to: `places resolve` 4, `search` 30, `alternative-dates` 30, `explore` 36 i `flexible-search` 60.
 
 ## Wejście i wyjście explore
 
@@ -43,7 +44,7 @@ Country discovery wymaga `level: "country"` i `anywhere: true`. City expansion u
 
 Każdy wynik ma publiczną `destination`, `best_price`, `best_direct_price`, nieautorytatywne `provider_tags` oraz wszystkie `origin_options`. Stan originu to `quoted`, `no_quote` albo `failed`. `no_quote` oznacza brak obserwacji ceny, nie brak lotu; `failed` zawiera stabilny kod i retryability. Cena jest orientacyjnym totalem kompletnej podróży całej grupy.
 
-`searched_at` jest czasem pobrania. Gdy provider nie podaje czasu obserwacji, `observed_at` pozostaje `null`. Stay jest adnotacją: konkretne daty dają `nights` i boolowskie `stay_match`, a month/anytime — `unknown`. `meta` zawiera `total_candidates`, `returned_candidates` i `truncated`. Agent powinien ujawnić partial failures i niepewność świeżości, a wybrany wynik sprawdzić przez `alternative-dates`, `flexible-search` albo live `search`.
+`searched_at` jest czasem pobrania. Gdy provider nie podaje czasu obserwacji, `observed_at` pozostaje `null`. Stay jest adnotacją: konkretne daty dają `nights` i boolowskie `stay_match`, a month/anytime — `unknown`. `meta` zawiera `total_candidates`, `returned_candidates`, `truncated` oraz `request_budget` z polami `limit`, `started` i `remaining`. Agent powinien ujawnić partial failures i niepewność świeżości, a wybrany wynik sprawdzić przez `alternative-dates`, `flexible-search` albo live `search`.
 
 ## Wejście search
 
@@ -77,7 +78,8 @@ Reguły walidacji:
 - `direct_only` implikuje `max_stops: 0`.
 - filtry godzinowe `depart_after`, `depart_before`, `return_after`, `return_before` przyjmują lokalne `HH:MM` i są stosowane po normalizacji itineraries.
 - `flexible-search` najpierw buduje siatkę `alternative-dates`, a następnie wybiera `date_candidates` (1-15, domyślnie 3) par do live `search`; wybór jest deterministycznie zbalansowany między originami (round-robin po posortowanych cenowo kolejkach per-origin), deduplikuje identyczne zapytania i nadal preferuje tańsze pary. Wynik zawiera `date_candidates` oraz `date_pair`/`guide_price` przy ofertach.
-- Workflow providera są serializowane między procesami CLI. Oczekiwanie na globalny lock respektuje deadline; walidacja i inne operacje lokalne nie wymagają locka. W obrębie jednego workflow Autosuggest/resolve korzysta z request-scoped cache i jednego współdzielonego klienta HTTP.
+- Workflow providera są serializowane między procesami CLI. Oczekiwanie na globalny lock respektuje deadline; walidacja i inne operacje lokalne nie wymagają locka. Domyślne workflow `search`, `explore`, `alternative-dates` i `flexible-search` wykonują resolve oraz fan-out originów sekwencyjnie także w obrębie procesu. W obrębie jednego workflow Autosuggest/resolve nadal korzysta z request-scoped cache, deduplikacji i jednego współdzielonego klienta HTTP. Pierwszy challenge zatrzymuje kolejne originy; CLI nie usuwa ich po cichu ani nie ponawia `BOT_CHALLENGE`.
+- Każdy rozpoczęty provider request zużywa jedną jednostkę `request_budget`, również retry dla timeoutów/5xx. Po wyczerpaniu limitu lokalna bramka zwraca `REQUEST_BUDGET_EXCEEDED` bez kolejnego requestu i raportuje wykorzystanie w `error.details.request_budget`.
 
 ## Wyjście search
 
@@ -170,18 +172,48 @@ W Explore prawidłowa `cheapest_direct_price` implikuje `direct_flights_availabl
   "status": "failed",
   "error": {
     "code": "BOT_CHALLENGE",
-    "message": "Run 'flights browser unlock' and complete the browser challenge",
+    "message": "The provider returned a browser challenge after the request reached it",
     "retryable": false,
-    "details": {}
+    "details": {
+      "source": "provider_response",
+      "network_attempted": true,
+      "provider_phase": "radar_create",
+      "challenge_kind": "provider_blocked",
+      "request_budget": {"limit": 30, "started": 4, "remaining": 26},
+      "circuit_breaker": {
+        "state": "open",
+        "opened_at": "2026-07-21T11:00:00Z",
+        "next_probe_at": "2026-07-21T11:15:00Z",
+        "cooldown_seconds": 900,
+        "cooldown_remaining": 900.0,
+        "remaining_seconds": 900.0,
+        "manual_half_open": false,
+        "storage_status": "valid"
+      }
+    }
   }
 }
 ```
 
-Stabilne kody: `INVALID_ARGUMENT`, `AMBIGUOUS_PLACE`, `BOT_CHALLENGE`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`, `SESSION_EXPIRED`, `PROVIDER_UNAVAILABLE`, `PROVIDER_PROTOCOL_ERROR`, `CONTRACT_CHANGED`, `INTERNAL_ERROR`.
+Stabilne kody: `INVALID_ARGUMENT`, `AMBIGUOUS_PLACE`, `BOT_CHALLENGE`, `REQUEST_BUDGET_EXCEEDED`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`, `SESSION_EXPIRED`, `PROVIDER_UNAVAILABLE`, `PROVIDER_PROTOCOL_ERROR`, `CONTRACT_CHANGED`, `INTERNAL_ERROR`.
 
-Exit codes: `0` sukces/użyteczny partial, `2` walidacja, `3` wymagany ręczny unlock, `4` provider po wyczerpaniu retry, `5` rate limit/deadline, `6` błąd wewnętrzny/schematu.
+Dla `BOT_CHALLENGE` pola diagnostyczne nie zależą od tekstu `message`:
+
+- `source: provider_response` i `network_attempted: true` oznaczają świeżą odpowiedź challenge z providera;
+- `source: local_circuit` i `network_attempted: false` oznaczają lokalny fail-fast bez HTTP;
+- `provider_phase` należy do bezpiecznego zbioru `autosuggest`, `radar_create`, `radar_poll`, `alternative_dates_create`, `alternative_dates_poll`, `local_gate`;
+- `challenge_kind` opisuje wyłącznie klasę zdarzenia (`http_status`, `redirect`, `provider_blocked`, `local_cooldown`) i nigdy nie zawiera URL, nagłówków, cookies ani tokenów;
+- `request_budget.started` jest wiarygodną liczbą requestów rozpoczętych przez koordynowany workflow. Gdy provider jest wywołany poza workflow, pole może być pominięte zamiast udawać dokładność.
+
+Exit codes: `0` sukces/użyteczny partial, `2` walidacja, `3` wymagany ręczny unlock, `4` provider po wyczerpaniu retry, `5` rate limit/deadline/request budget, `6` błąd wewnętrzny/schematu.
 
 Pierwszy `BOT_CHALLENGE` otwiera współdzielony między procesami circuit breaker. Kolejne workflow kończą się fail-fast kodem 3 bez requestu do providera. Po cooldownie tylko zserializowany workflow przechodzi do half-open; ponowny challenge otwiera circuit ponownie. `browser unlock` samo otwiera widoczną przeglądarkę i nie twierdzi, że search działa. Po ręcznym ukończeniu challenge `browser unlock --probe` wykonuje pojedynczy lekki probe; jego sukces ustawia lokalny circuit na half-open i pozostawia użytkownikowi dokładnie jeden kontrolowany retry oryginalnej komendy. Cookies, tokeny i nagłówki przeglądarki nie są kopiowane.
+
+## Circuit status (offline)
+
+`flights circuit status --json` odczytuje wyłącznie lokalny, niesekretny plik stanu pod krótkim lockiem. Nie tworzy klienta HTTP i nie dotyka sieci. Zwraca `network_checked: false`, `search_readiness` oraz `circuit_breaker` z `state`, `opened_at`, `next_probe_at`, `cooldown_remaining`, kompatybilnym `remaining_seconds`, `manual_half_open` i `storage_status`.
+
+Brak pliku daje bezpieczny stan `closed` + `storage_status: missing`; stan uszkodzony daje `closed` + `corrupt`; otwarty stan po cooldownie pozostaje obserwowalny jako `open` + `stale`, z readiness `controlled_retry`. Status `allowed` oznacza wyłącznie, że lokalny circuit nie blokuje workflow — nie gwarantuje działania prywatnego API. Nie istnieje bezwarunkowa komenda reset.
 
 ## Doctor
 
@@ -194,11 +226,15 @@ Pierwszy `BOT_CHALLENGE` otwiera współdzielony między procesami circuit break
   "search_readiness": {"status": "unknown", "reason": "radar_not_checked"},
   "circuit_breaker": {
     "state": "closed",
+    "opened_at": null,
+    "next_probe_at": null,
     "cooldown_seconds": 900,
+    "cooldown_remaining": 0.0,
     "remaining_seconds": 0.0,
-    "manual_half_open": false
+    "manual_half_open": false,
+    "storage_status": "missing"
   }
 }
 ```
 
-Stan `ok` potwierdza tylko wykonane lekkie checki, nie gotowość live search. Przy otwartym/half-open circuit `doctor` nie zużywa kontrolowanego retry, pomija HTTP i zwraca `degraded` oraz bieżący stan circuit breakera.
+Stan `ok` potwierdza tylko wykonane lekkie checki, nie gotowość live search. `network_checks_attempted` jawnie mówi, czy `doctor` próbował DNS/TLS/HTTP. Przy otwartym/half-open circuit `doctor` nie zużywa kontrolowanego retry, pomija HTTP i zwraca `degraded`, readiness wynikające z lokalnej bramki oraz bieżący stan circuit breakera.

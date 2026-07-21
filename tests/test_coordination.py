@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 import os
 import time
@@ -17,6 +18,7 @@ from flights_tracker.coordination import (
     open_circuit,
     provider_workflow,
 )
+from flights_tracker.cli import dispatch, parser
 from flights_tracker.errors import FlightsError, ProviderError
 from flights_tracker.provider import SkyscannerWebProvider
 from flights_tracker.service import run_search
@@ -280,3 +282,174 @@ async def test_bot_stop_signal_blocks_later_provider_requests() -> None:
             assert second.value.code == "BOT_CHALLENGE"
     assert requests == 1
     assert (await circuit_status())["state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_fresh_challenge_and_local_gate_have_stable_distinct_diagnostics() -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if "autosuggest" in request.url.path:
+            query = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json=[{
+                    "PlaceName": query,
+                    "IataCode": query,
+                    "GeoId": query,
+                    "GeoContainerId": query,
+                    "CountryId": "PL",
+                }],
+            )
+        return httpx.Response(403, json={"reason": "blocked"})
+
+    request = {
+        "origins": [{"iata": "WAW"}],
+        "destination": {"iata": "ROM"},
+        "trip": {"type": "one_way", "depart": {"date": "2027-01-01"}},
+    }
+    with pytest.raises(ProviderError) as fresh:
+        await run_search(request, transport=httpx.MockTransport(handler))
+
+    fresh_details = fresh.value.details
+    assert fresh.value.retryable is False
+    assert fresh_details["source"] == "provider_response"
+    assert fresh_details["network_attempted"] is True
+    assert fresh_details["provider_phase"] == "radar_create"
+    assert fresh_details["challenge_kind"] == "provider_blocked"
+    assert fresh_details["request_budget"] == {"limit": 30, "started": 3, "remaining": 27}
+    assert fresh_details["circuit_breaker"]["state"] == "open"
+    assert fresh_details["circuit_breaker"]["opened_at"]
+    assert fresh_details["circuit_breaker"]["next_probe_at"]
+    first_request_count = requests
+
+    with pytest.raises(ProviderError) as local:
+        await run_search(
+            request,
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    AssertionError("local circuit must not create an HTTP request")
+                )
+            ),
+        )
+
+    local_details = local.value.details
+    assert requests == first_request_count
+    assert local.value.retryable is False
+    assert local_details["source"] == "local_circuit"
+    assert local_details["network_attempted"] is False
+    assert local_details["provider_phase"] == "local_gate"
+    assert local_details["challenge_kind"] == "local_cooldown"
+    assert local_details["request_budget"] == {"limit": 30, "started": 0, "remaining": 30}
+
+
+@pytest.mark.asyncio
+async def test_circuit_status_command_is_offline_for_missing_and_corrupt_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class ForbiddenClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("offline circuit status must not create an HTTP client")
+
+    monkeypatch.setattr("flights_tracker.cli.httpx.AsyncClient", ForbiddenClient)
+    args = parser().parse_args(["circuit", "status", "--json"])
+    missing = await dispatch(args)
+    assert missing["network_checked"] is False
+    assert missing["circuit_breaker"]["state"] == "closed"
+    assert missing["circuit_breaker"]["storage_status"] == "missing"
+    assert missing["search_readiness"] == {
+        "status": "allowed", "reason": "circuit_closed"
+    }
+
+    state_file = tmp_path / "provider-state" / "provider-circuit.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text("{corrupt")
+    corrupt = await dispatch(args)
+    assert corrupt["circuit_breaker"]["state"] == "closed"
+    assert corrupt["circuit_breaker"]["storage_status"] == "corrupt"
+
+    state_file.write_text(json.dumps({
+        "state": "open",
+        "opened_at": time.time() - 120,
+        "manual_half_open": False,
+    }))
+    stale = await dispatch(args)
+    assert stale["circuit_breaker"]["state"] == "open"
+    assert stale["circuit_breaker"]["storage_status"] == "stale"
+    assert stale["circuit_breaker"]["cooldown_remaining"] == 0
+    assert stale["search_readiness"] == {
+        "status": "controlled_retry", "reason": "cooldown_elapsed"
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_budget_stops_network_and_is_reported() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        query = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200,
+            json=[{
+                "PlaceName": query,
+                "IataCode": query,
+                "GeoId": query,
+                "GeoContainerId": query,
+                "CountryId": "PL",
+            }],
+        )
+
+    response = await run_search(
+        {
+            "origins": [{"iata": "WAW"}],
+            "destination": {"iata": "ROM"},
+            "trip": {"type": "one_way", "depart": {"date": "2027-01-01"}},
+            "request_budget": 2,
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert len(paths) == 2
+    assert response["status"] == "failed"
+    assert response["error"]["code"] == "REQUEST_BUDGET_EXCEEDED"
+    assert response["error"]["details"]["source"] == "local_budget"
+    assert response["error"]["details"]["network_attempted"] is False
+    assert response["meta"]["request_budget"] == {"limit": 2, "started": 2, "remaining": 0}
+
+
+def test_browser_probe_waits_for_cross_process_workflow_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    output = context.Queue()
+    state_directory = str(tmp_path / "provider-state")
+    holder = context.Process(
+        target=_hold_workflow, args=(state_directory, "holder", 0.25, output)
+    )
+    holder.start()
+    assert output.get(timeout=2)[:2] == ("holder", "acquired")
+    os.environ["FLIGHTS_TRACKER_STATE_DIR"] = state_directory
+
+    class FakeProvider:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def autosuggest(self, query: str) -> list[dict[str, str]]:
+            return [{"PlaceName": query}]
+
+    monkeypatch.setattr("flights_tracker.cli.shutil.which", lambda _: "/bin/playwright-cli")
+    monkeypatch.setattr("flights_tracker.cli.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("flights_tracker.cli.SkyscannerWebProvider", FakeProvider)
+    started = time.monotonic()
+    result = asyncio.run(
+        dispatch(parser().parse_args(["browser", "unlock", "--probe", "--json"]))
+    )
+    elapsed = time.monotonic() - started
+    holder.join(timeout=2)
+
+    assert holder.exitcode == 0
+    assert elapsed >= 0.18
+    assert result["probe"] == "ok"

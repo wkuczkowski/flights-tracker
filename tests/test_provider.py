@@ -57,6 +57,11 @@ async def test_bot_challenge_mapping() -> None:
             await SkyscannerWebProvider(client).autosuggest("WAW")
     assert caught.value.code == "BOT_CHALLENGE"
     assert caught.value.exit_code == 3
+    assert caught.value.retryable is False
+    assert caught.value.details["source"] == "provider_response"
+    assert caught.value.details["network_attempted"] is True
+    assert caught.value.details["provider_phase"] == "autosuggest"
+    assert caught.value.details["challenge_kind"] == "provider_blocked"
 
 
 @pytest.mark.asyncio
@@ -99,6 +104,128 @@ def test_alt_session_status_does_not_treat_incomplete_as_complete() -> None:
     assert not _alt_session_complete("POLLING_SESSION_STATUS_INCOMPLETE")
     assert _alt_session_complete("POLLING_SESSION_STATUS_COMPLETE")
     assert not _alt_session_incomplete("POLLING_SESSION_STATUS_COMPLETE")
+
+
+@pytest.mark.asyncio
+async def test_radar_create_challenge_has_phase_and_safe_kind() -> None:
+    async with httpx.AsyncClient(
+        base_url="https://www.skyscanner.pl",
+        transport=httpx.MockTransport(lambda request: httpx.Response(403)),
+    ) as client:
+        with pytest.raises(ProviderError) as caught:
+            await SkyscannerWebProvider(client, retries=0).search_one(
+                {"GeoId": "origin"},
+                {"GeoId": "destination"},
+                depart=date(2027, 1, 1),
+                return_date=None,
+                adults=1,
+                child_ages=[],
+                cabin="economy",
+                deadline=time.monotonic() + 1,
+            )
+
+    assert caught.value.details["provider_phase"] == "radar_create"
+    assert caught.value.details["challenge_kind"] == "http_status"
+
+
+@pytest.mark.asyncio
+async def test_radar_poll_challenge_has_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("flights_tracker.provider.asyncio.sleep", lambda _: _noop())
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "context": {"status": "incomplete", "sessionId": "opaque-session"},
+                    "itineraries": {"results": []},
+                },
+            )
+        return httpx.Response(403, json={"reason": "blocked"})
+
+    async with httpx.AsyncClient(
+        base_url="https://www.skyscanner.pl", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(ProviderError) as caught:
+            await SkyscannerWebProvider(client, retries=0).search_one(
+                {"GeoId": "origin"},
+                {"GeoId": "destination"},
+                depart=date(2027, 1, 1),
+                return_date=None,
+                adults=1,
+                child_ages=[],
+                cabin="economy",
+                deadline=time.monotonic() + 1,
+            )
+
+    assert caught.value.details["provider_phase"] == "radar_poll"
+
+
+@pytest.mark.asyncio
+async def test_alternative_dates_create_challenge_has_phase() -> None:
+    async with httpx.AsyncClient(
+        base_url="https://www.skyscanner.pl",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(403, json={"reason": "blocked"})
+        ),
+    ) as client:
+        with pytest.raises(ProviderError) as caught:
+            await SkyscannerWebProvider(client, retries=0).alternative_dates(
+                {"GeoId": "origin"},
+                {"GeoId": "destination"},
+                depart=date(2027, 1, 1),
+                return_date=None,
+                adults=1,
+                child_ages=[],
+                cabin="economy",
+                deadline=time.monotonic() + 1,
+            )
+
+    assert caught.value.details["provider_phase"] == "alternative_dates_create"
+
+
+@pytest.mark.asyncio
+async def test_alternative_dates_poll_challenge_has_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("flights_tracker.provider.asyncio.sleep", lambda _: _noop())
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "pollingSession": {
+                        "status": "POLLING_SESSION_STATUS_INCOMPLETE",
+                        "pollingSessionId": "opaque-session",
+                    },
+                    "alternativeDates": [],
+                },
+            )
+        return httpx.Response(403, json={"reason": "blocked"})
+
+    async with httpx.AsyncClient(
+        base_url="https://www.skyscanner.pl", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(ProviderError) as caught:
+            await SkyscannerWebProvider(client, retries=0).alternative_dates(
+                {"GeoId": "origin"},
+                {"GeoId": "destination"},
+                depart=date(2027, 1, 1),
+                return_date=None,
+                adults=1,
+                child_ages=[],
+                cabin="economy",
+                deadline=time.monotonic() + 1,
+            )
+
+    assert caught.value.details["provider_phase"] == "alternative_dates_poll"
 
 
 @pytest.mark.asyncio

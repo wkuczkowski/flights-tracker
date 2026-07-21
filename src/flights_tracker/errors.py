@@ -6,7 +6,7 @@ class FlightsError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-        self.retryable = retryable
+        self.retryable = False if code == "BOT_CHALLENGE" else retryable
         self.details = details or {}
 
     @property
@@ -15,7 +15,7 @@ class FlightsError(Exception):
             return 2
         if self.code == "BOT_CHALLENGE":
             return 3
-        if self.code in {"RATE_LIMITED", "PROVIDER_TIMEOUT"}:
+        if self.code in {"RATE_LIMITED", "PROVIDER_TIMEOUT", "REQUEST_BUDGET_EXCEEDED"}:
             return 5
         if self.code in {"INTERNAL_ERROR", "CONTRACT_CHANGED"}:
             return 6

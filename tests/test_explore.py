@@ -203,7 +203,7 @@ async def test_resolution_bot_challenge_promptly_cancels_hanging_resolver(monkey
     monkeypatch.setattr("flights_tracker.service.SkyscannerWebProvider", FakeProvider)
     started = time.monotonic()
     with pytest.raises(FlightsError) as caught:
-        await run_explore(request())
+        await run_explore(request(), concurrency=2)
     assert caught.value.code == "BOT_CHALLENGE"
     assert time.monotonic() - started < 0.5
     assert hanging_cancelled.is_set()

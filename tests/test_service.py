@@ -70,6 +70,58 @@ async def test_fanout_normalizes_sorts_and_limits() -> None:
     assert response["status"] == "complete"
     assert [x["price"]["amount"] for x in response["results"]] == ["100.00", "200.00"]
     assert response["meta"]["origins_succeeded"] == 2
+    assert response["meta"]["request_budget"] == {
+        "limit": 30, "started": 5, "remaining": 25
+    }
+
+
+@pytest.mark.asyncio
+async def test_default_multi_origin_workflow_is_strictly_serial_and_ordered() -> None:
+    order: list[str] = []
+    active = 0
+    max_active = 0
+
+    async def handler(call: httpx.Request) -> httpx.Response:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            if "autosuggest" in call.url.path:
+                query = call.url.path.rsplit("/", 1)[-1]
+                order.append(f"resolve:{query}")
+                return httpx.Response(
+                    200,
+                    json=[{
+                        "PlaceName": query,
+                        "IataCode": query if len(query) == 3 else "ROM",
+                        "GeoId": query,
+                        "GeoContainerId": query,
+                        "CountryId": "PL",
+                    }],
+                )
+            origin = json.loads(call.content)["legs"][0]["legOrigin"]["entityId"]
+            order.append(f"radar:{origin}")
+            return httpx.Response(
+                200,
+                json={
+                    "context": {"status": "complete"},
+                    "itineraries": {"results": []},
+                },
+            )
+        finally:
+            active -= 1
+
+    await run_search(request(), transport=httpx.MockTransport(handler))
+
+    assert max_active == 1
+    assert order == [
+        "resolve:Rzym",
+        "resolve:WAW",
+        "resolve:POZ",
+        "radar:WAW",
+        "radar:POZ",
+    ]
 
 
 @pytest.mark.asyncio
@@ -88,6 +140,7 @@ async def test_all_creates_blocked_is_failed() -> None:
 @pytest.mark.asyncio
 async def test_bot_challenge_cancels_queued_origins_before_create() -> None:
     creates = []
+    baseline_tasks = set(asyncio.all_tasks())
     req = request()
     req["origins"].append({"iata": "GDN"})
 
@@ -103,6 +156,12 @@ async def test_bot_challenge_cancels_queued_origins_before_create() -> None:
         await run_search(req, concurrency=1, transport=httpx.MockTransport(handler))
     assert caught.value.code == "BOT_CHALLENGE"
     assert creates == ["WAW"]
+    await asyncio.sleep(0)
+    assert not {
+        task
+        for task in asyncio.all_tasks()
+        if task not in baseline_tasks and not task.done()
+    }
 
 
 @pytest.mark.parametrize("mutation", [

@@ -95,9 +95,18 @@ class SkyscannerWebProvider:
             })
         return headers
 
-    async def _request(self, method: str, path: str, *, view_id: str | None = None, json: Any = None, deadline: float | None = None) -> Any:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        provider_phase: str = "provider_request",
+        view_id: str | None = None,
+        json: Any = None,
+        deadline: float | None = None,
+    ) -> Any:
         for attempt in range(self.retries + 1):
-            await before_provider_request()
+            await before_provider_request(provider_phase)
             try:
                 request = self.client.request(method, path, headers=self._headers(view_id), json=json)
                 if deadline is None:
@@ -121,8 +130,20 @@ class SkyscannerWebProvider:
                 except Exception:
                     pass
                 if response.status_code == 403 or "captcha" in location or reason == "blocked":
-                    await record_bot_challenge()
-                    raise ProviderError("BOT_CHALLENGE", "Skyscanner blocked this network session; complete its browser challenge and retry")
+                    challenge_kind = (
+                        "redirect" if response.status_code == 307 or "captcha" in location
+                        else "provider_blocked" if reason == "blocked"
+                        else "http_status"
+                    )
+                    details = await record_bot_challenge(
+                        provider_phase=provider_phase, challenge_kind=challenge_kind
+                    )
+                    raise ProviderError(
+                        "BOT_CHALLENGE",
+                        "The provider returned a browser challenge after the request reached it",
+                        retryable=False,
+                        details=details,
+                    )
             if response.status_code == 429:
                 retry_after = response.headers.get("retry-after")
                 wait = _retry_after_seconds(retry_after, fallback=0.5 * 2**attempt)
@@ -139,8 +160,15 @@ class SkyscannerWebProvider:
                 raise ProviderError("PROVIDER_UNAVAILABLE", f"Skyscanner returned HTTP {response.status_code}", retryable=response.status_code >= 500)
             if "html" in content_type or response.text.lstrip().lower().startswith("<!doctype html"):
                 if "captcha" in response.text.lower() or "perimeterx" in response.text.lower():
-                    await record_bot_challenge()
-                    raise ProviderError("BOT_CHALLENGE", "Skyscanner returned a browser challenge")
+                    details = await record_bot_challenge(
+                        provider_phase=provider_phase, challenge_kind="provider_blocked"
+                    )
+                    raise ProviderError(
+                        "BOT_CHALLENGE",
+                        "The provider returned a browser challenge after the request reached it",
+                        retryable=False,
+                        details=details,
+                    )
                 raise ProviderError("CONTRACT_CHANGED", "Skyscanner returned HTML instead of JSON")
             try:
                 return response.json()
@@ -153,7 +181,7 @@ class SkyscannerWebProvider:
         path += f"?isDestination={'true' if destination else 'false'}&enable_general_search_v2=true&autosuggestExp="
         data = await cached_provider_call(
             ("autosuggest", self.culture.market, self.culture.locale, query, destination),
-            lambda: self._request("GET", path),
+            lambda: self._request("GET", path, provider_phase="autosuggest"),
         )
         if not isinstance(data, list):
             raise ProviderError("CONTRACT_CHANGED", "Autosuggest response is no longer a list")
@@ -233,7 +261,14 @@ class SkyscannerWebProvider:
         if return_date:
             legs.append(_radar_leg(destination, origin, return_date))
         body = {"cabinClass": cabin.upper(), "childAges": child_ages, "adults": adults, "legs": legs}
-        data = await self._request("POST", "/g/radar/api/v2/web-unified-search/", view_id=view_id, json=body, deadline=deadline)
+        data = await self._request(
+            "POST",
+            "/g/radar/api/v2/web-unified-search/",
+            provider_phase="radar_create",
+            view_id=view_id,
+            json=body,
+            deadline=deadline,
+        )
         snapshot = _results(data)
         status, session_id = _context(data)
         polls = 0
@@ -242,7 +277,13 @@ class SkyscannerWebProvider:
             await asyncio.sleep(delay)
             encoded = quote(session_id, safe="")
             try:
-                data = await self._request("GET", f"/g/radar/api/v2/web-unified-search/{encoded}", view_id=view_id, deadline=deadline)
+                data = await self._request(
+                    "GET",
+                    f"/g/radar/api/v2/web-unified-search/{encoded}",
+                    provider_phase="radar_poll",
+                    view_id=view_id,
+                    deadline=deadline,
+                )
             except ProviderError as exc:
                 if exc.code == "SESSION_EXPIRED" and not _recreated and time.monotonic() < deadline:
                     return await self.search_one(origin, destination, depart=depart, return_date=return_date, adults=adults, child_ages=child_ages, cabin=cabin, deadline=deadline, _recreated=True)
@@ -273,7 +314,17 @@ class SkyscannerWebProvider:
         complete = False
         delay = 0.5
         while time.monotonic() < deadline:
-            data = await self._request("POST", "/g/radar/api/v1/alternative-dates", view_id=view_id, json=body, deadline=deadline)
+            data = await self._request(
+                "POST",
+                "/g/radar/api/v1/alternative-dates",
+                provider_phase=(
+                    "alternative_dates_poll" if "pollingSessionId" in body
+                    else "alternative_dates_create"
+                ),
+                view_id=view_id,
+                json=body,
+                deadline=deadline,
+            )
             if not isinstance(data, dict):
                 raise ProviderError("CONTRACT_CHANGED", "Alternative-dates response must be an object")
             found = data.get("alternativeDates", [])
@@ -325,7 +376,12 @@ class SkyscannerWebProvider:
         }
         expected = "countryDestination" if destination else "everywhereDestination"
         data = await self._request(
-            "POST", "/g/radar/api/v2/web-unified-search/", view_id=view_id, json=body, deadline=deadline
+            "POST",
+            "/g/radar/api/v2/web-unified-search/",
+            provider_phase="radar_create",
+            view_id=view_id,
+            json=body,
+            deadline=deadline,
         )
         snapshot = _explore_collection(data, expected=expected, currency=self.culture.currency)
         polls = 0
@@ -336,6 +392,7 @@ class SkyscannerWebProvider:
             data = await self._request(
                 "GET",
                 f"/g/radar/api/v2/web-unified-search/{quote(session_id, safe='')}",
+                provider_phase="radar_poll",
                 view_id=view_id,
                 deadline=deadline,
             )

@@ -15,9 +15,10 @@ import httpx
 from . import __version__
 from .coordination import (
     allow_manual_half_open,
+    circuit_search_readiness,
     circuit_status,
-    open_circuit,
     provider_workflow,
+    provider_workflow_lock,
     workflow_client,
 )
 from .errors import FlightsError
@@ -58,6 +59,12 @@ def parser() -> argparse.ArgumentParser:
     e.add_argument("--request", metavar="FILE", required=True, help="Read complete JSON request from FILE or -"); _json_flag(e)
     d = sub.add_parser("doctor", help="Probe endpoint access and contract without creating a flight search")
     _culture(d); _json_flag(d)
+    c = sub.add_parser("circuit", help="Inspect the local provider circuit without network access")
+    circuit_sub = c.add_subparsers(dest="circuit_command", required=True)
+    circuit_status_parser = circuit_sub.add_parser(
+        "status", help="Show offline circuit and cooldown status"
+    )
+    _json_flag(circuit_status_parser)
     b = sub.add_parser("browser", help="Manual browser challenge helpers")
     browser_sub = b.add_subparsers(dest="browser_command", required=True)
     unlock = browser_sub.add_parser("unlock", help="Open a persistent visible browser for manual verification")
@@ -84,7 +91,9 @@ def _search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--return-after", help="Keep return departures at/after HH:MM local")
     p.add_argument("--return-before", help="Keep return departures at/before HH:MM local")
     p.add_argument("--sort", choices=["price", "duration"], default="price")
-    p.add_argument("--limit", type=int, default=20); p.add_argument("--timeout", type=float, default=60.0); _culture(p)
+    p.add_argument("--limit", type=int, default=20); p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--request-budget", type=int, help="Maximum provider requests started by this workflow")
+    _culture(p)
 
 
 def _alt_dates_args(p: argparse.ArgumentParser) -> None:
@@ -136,6 +145,8 @@ def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "limit": args.limit,
         "timeout": args.timeout,
     }
+    if args.request_budget is not None:
+        data["request_budget"] = args.request_budget
     if getattr(args, "min_nights", None) is not None or getattr(args, "max_nights", None) is not None:
         data["stay"] = {}
         if getattr(args, "min_nights", None) is not None:
@@ -194,6 +205,17 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 details=error.get("details") or {},
             )
         return response
+    if args.command == "circuit":
+        circuit = await circuit_status()
+        readiness = circuit_search_readiness(circuit)
+        return {
+            "schema_version": "1.0",
+            "status": "ok" if readiness["status"] == "allowed" else "degraded",
+            "provider": "skyscanner_web",
+            "network_checked": False,
+            "search_readiness": readiness,
+            "circuit_breaker": circuit,
+        }
     if args.command == "doctor":
         started = time.monotonic()
         circuit = await circuit_status()
@@ -204,10 +226,12 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "autosuggest_contract": "not_checked",
             "radar": "not_checked",
         }
+        network_checks_attempted = False
         status = "degraded" if circuit["state"] != "closed" else "ok"
         if circuit["state"] == "closed":
+            network_checks_attempted = True
             try:
-                async with provider_workflow(started + 15):
+                async with provider_workflow(started + 15, request_budget=1):
                     async with workflow_client(
                         transport=None, timeout=httpx.Timeout(15, connect=5)
                     ) as client:
@@ -230,15 +254,17 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 checks["http"] = "BOT_CHALLENGE"
                 checks["autosuggest_contract"] = "not_checked"
                 circuit = await circuit_status()
+        if circuit["state"] == "closed":
+            readiness = {"status": "unknown", "reason": "radar_not_checked"}
+        else:
+            readiness = circuit_search_readiness(circuit)
         return {
             "schema_version": "1.0",
             "status": status,
             "provider": "skyscanner_web",
             "checks": checks,
-            "search_readiness": {
-                "status": "unknown",
-                "reason": "radar_not_checked",
-            },
+            "network_checks_attempted": network_checks_attempted,
+            "search_readiness": readiness,
             "circuit_breaker": circuit,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
@@ -248,21 +274,53 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             raise FlightsError("PROVIDER_UNAVAILABLE", "playwright-cli is required for browser unlock")
         command = [executable, "-s=skyscanner-unlock", "open", BASE_URL, "--headed"]
         command.append(f"--profile={args.profile}" if args.profile else "--persistent")
-        try:
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise FlightsError("PROVIDER_UNAVAILABLE", "Could not open the manual unlock browser") from exc
+
+        async def open_browser(deadline: float) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FlightsError(
+                    "PROVIDER_TIMEOUT", "Browser unlock deadline reached", retryable=True
+                )
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    command,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=min(30.0, remaining),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise FlightsError(
+                    "PROVIDER_TIMEOUT", "Manual unlock browser did not open before the deadline",
+                    retryable=True,
+                ) from exc
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise FlightsError("PROVIDER_UNAVAILABLE", "Could not open the manual unlock browser") from exc
+
         probe = "not_requested"
         if args.probe:
-            try:
-                async with httpx.AsyncClient(base_url=BASE_URL, timeout=10, follow_redirects=False) as client:
-                    await SkyscannerWebProvider(client, retries=0).autosuggest("Warszawa")
-                probe = "ok"
-                await allow_manual_half_open()
-            except FlightsError as exc:
-                probe = exc.code
-                if exc.code == "BOT_CHALLENGE":
-                    await open_circuit()
+            deadline = time.monotonic() + 45
+            async with provider_workflow_lock(deadline):
+                await open_browser(deadline)
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise FlightsError(
+                            "PROVIDER_TIMEOUT", "Browser probe deadline reached", retryable=True
+                        )
+                    async with httpx.AsyncClient(
+                        base_url=BASE_URL,
+                        timeout=httpx.Timeout(min(10.0, remaining), connect=min(5.0, remaining)),
+                        follow_redirects=False,
+                    ) as client:
+                        await SkyscannerWebProvider(client, retries=0).autosuggest("Warszawa")
+                    probe = "ok"
+                    await allow_manual_half_open()
+                except FlightsError as exc:
+                    probe = exc.code
+        else:
+            await open_browser(time.monotonic() + 30)
         circuit = await circuit_status()
         return {
             "schema_version": "1.0",
@@ -276,7 +334,8 @@ async def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 "message": (
                     "Complete any verification in the opened headed browser. Then run "
                     "'flights browser unlock --probe --json'; if it enables half-open, retry "
-                    "the original provider command once"
+                    "the original provider command once. The browser profile is separate and "
+                    "does not transfer cookies or other browser state to HTTP workflows"
                 ),
             },
         }

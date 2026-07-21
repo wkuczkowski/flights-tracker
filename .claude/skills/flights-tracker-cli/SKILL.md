@@ -167,6 +167,8 @@ flights search --request - --json < request.json \
 
 Check both the process exit code and the JSON `status` or `error.code`. Do not scrape human-readable diagnostics.
 
+Successful provider workflows expose `meta.request_budget` with `limit`, `started`, and `remaining`. This is the count of provider requests actually started by the coordinated workflow, including retries. Multi-origin CLI workflows are sequential by default; do not add parallel shell fan-out around them.
+
 ## Handle failures
 
 Interpret exit codes as follows:
@@ -178,7 +180,19 @@ Interpret exit codes as follows:
 - `5`: rate limit or deadline exhausted.
 - `6`: internal, schema, or contract error.
 
-On exit `3` or JSON error `BOT_CHALLENGE`, stop all provider work. The shared circuit breaker makes later CLI processes fail fast without sending more provider requests. First open the persistent visible browser:
+On exit `3` or JSON error `BOT_CHALLENGE`, stop all provider work. `retryable` is always false. Inspect stable fields rather than parsing `message`:
+
+- `source: provider_response`, `network_attempted: true`: the request reached the provider and received a challenge;
+- `source: local_circuit`, `network_attempted: false`: local cooldown stopped the workflow without HTTP;
+- `provider_phase`, `challenge_kind`, `request_budget`, and `circuit_breaker` provide safe diagnostics without URLs, headers, cookies or tokens.
+
+Check the shared state offline first:
+
+```bash
+flights circuit status --json
+```
+
+This command never creates an HTTP client. `search_readiness.status: allowed` only means the local circuit is closed; it does not prove provider access. If cooldown is active, do not run another provider command. When manual recovery is appropriate, open the persistent visible browser:
 
 ```bash
 flights browser unlock
@@ -190,7 +204,7 @@ Then ask the user to complete the challenge in that browser. After the user conf
 flights browser unlock --probe --json
 ```
 
-An `ok` probe does not prove Radar/search readiness; it only permits one controlled retry. Rerun the original command once and report another challenge instead of looping. Never automate CAPTCHA solving, copy browser cookies/headers/tokens, or print browser state and cookies.
+The probe is serialized by the same cross-process workflow lock as search/explore. An `ok` probe does not prove Radar/search readiness; it only permits one controlled retry. Rerun the original command once and report another challenge instead of looping. Never automate CAPTCHA solving, copy browser cookies/headers/tokens, or print browser state and cookies.
 
 Use the diagnostic command when access or configuration is uncertain:
 
@@ -198,7 +212,7 @@ Use the diagnostic command when access or configuration is uncertain:
 flights doctor --json
 ```
 
-`doctor` intentionally leaves `search_readiness.status` as `unknown` when Radar is `not_checked`. It also reports the shared circuit-breaker state and skips HTTP while the circuit is open or half-open, preserving the controlled retry.
+`doctor` intentionally leaves `search_readiness.status` as `unknown` when Radar is `not_checked` and the circuit is closed. Its `network_checks_attempted` field makes the network behavior explicit. It reports the same offline circuit snapshot and skips HTTP while the circuit is open or half-open, preserving the controlled retry.
 
 Preserve the user's dates, passengers, cabin, filters, and locale across retries. Summarize the best results with total price, origin, airports, times, stops, carriers, airport-change status, and any self-transfer or partial-result warnings. Treat `is_self_transfer: null` and `airport_change: null` as unknown, not false. Treat `carrier.alternate_code` as provider display data, not verified IATA.
 
