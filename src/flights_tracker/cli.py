@@ -97,14 +97,7 @@ def _flexible_args(p: argparse.ArgumentParser) -> None:
 
 def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.request:
-        try:
-            text = sys.stdin.read() if args.request == "-" else Path(args.request).read_text()
-            data = json.loads(text)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise FlightsError("INVALID_ARGUMENT", f"Cannot read JSON request: {exc}") from None
-        if not isinstance(data, dict):
-            raise FlightsError("INVALID_ARGUMENT", "JSON request must be an object")
-        return data
+        return _structured_request(args.request)
     if not args.origin or not args.destination or not args.depart:
         raise FlightsError("INVALID_ARGUMENT", "--origin, --destination and --depart are required without --request")
     filters: dict[str, Any] = {"direct_only": args.direct, "max_stops": args.max_stops}

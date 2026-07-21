@@ -25,6 +25,16 @@
 - `429 Retry-After` i jitter testowane fake clockiem;
 - globalne sortowanie/deduplikacja przed `limit`.
 
+Jawna macierz regresyjna Explore dla preferowanych originów:
+
+| Origin | Symulowany wynik providera | Oczekiwany stan originu | Wpływ na odpowiedź |
+|---|---|---|---|
+| WAW | `complete` z obserwacjami | `quoted` | wyniki zostają zachowane |
+| POZ | timeout po wyczerpaniu retry/deadline | `failed / PROVIDER_TIMEOUT` | useful `partial`, bez utraty WAW |
+| GDN | powtarzalne HTTP `503` | `failed / PROVIDER_UNAVAILABLE` | useful `partial`, bez utraty WAW |
+
+Osobna regresja utrzymuje wynik ukończonego originu, gdy drugi task nadal trwa w momencie wyczerpania wspólnego deadline. Niedokończony task otrzymuje jawny per-origin timeout; orchestrator nie odrzuca ukończonych outcomes.
+
 ### Contract/fixtures
 
 Fixture prywatnego Radar/Autosuggest musi być sanitizowana i walidowana przeciw własnemu modelowi. Testy sprawdzają brakujące pola, nieznane enumy i zmianę kształtu odpowiedzi. CI domyślnie używa mock HTTP bez sieci. Smoke test live ma niski fan-out, osobny marker i nie działa domyślnie.

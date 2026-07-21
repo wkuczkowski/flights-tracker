@@ -366,12 +366,6 @@ def _public_country(original: dict[str, Any], resolved: dict[str, Any]) -> dict[
     }
 
 
-def _indicative_price(value: Any, currency: str) -> dict[str, str] | None:
-    if not isinstance(value, dict) or value.get("rawPrice") is None:
-        return None
-    return {"amount": decimal_string(value["rawPrice"]), "currency": currency}
-
-
 def _stay_annotation(req: dict[str, Any]) -> tuple[int | None, bool | str]:
     depart, returned = req.get("_depart_exact"), req.get("_return_exact")
     if not depart or not returned:
@@ -466,12 +460,12 @@ async def run_explore(
                 if bot_event.is_set():
                     return ProviderError("BOT_CHALLENGE", "Skyscanner blocked this network session")
                 try:
-                    rows, tags, total, polls, complete = await provider.explore_one(
+                    snapshot = await provider.explore_one(
                         origin, country, depart=req["_depart"], return_date=req["_return"],
                         adults=passengers.get("adults", 1), child_ages=passengers.get("children_ages", []),
                         cabin=req.get("cabin", "economy"), deadline=deadline,
                     )
-                    return country_index, origin_index, rows, tags, total, polls, complete
+                    return country_index, origin_index, snapshot
                 except FlightsError as exc:
                     if exc.code == "BOT_CHALLENGE":
                         bot_event.set()
@@ -486,32 +480,37 @@ async def run_explore(
         async def indexed(country_index: int, origin_index: int, origin: dict[str, Any], country: dict[str, Any] | None) -> tuple[tuple[int, int], Any]:
             return (country_index, origin_index), await one(country_index, origin_index, origin, country)
 
-        tasks = [
-            asyncio.create_task(indexed(ci, oi, origin, country))
+        tasks = {
+            asyncio.create_task(indexed(ci, oi, origin, country)): (ci, oi)
             for ci, country in enumerate(countries)
             for oi, origin in enumerate(origins)
             if isinstance(origin, dict)
-        ]
-        try:
-            async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-                for completed in asyncio.as_completed(tasks):
-                    key, outcome = await completed
-                    outcomes[key] = outcome
-                    if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
-                        for task in tasks:
-                            if not task.done():
-                                task.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        raise outcome
-        except TimeoutError as exc:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise ProviderError("PROVIDER_TIMEOUT", "Explore deadline reached", retryable=True) from exc
+        }
+        pending = set(tasks)
+        while pending and (remaining := deadline - time.monotonic()) > 0:
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
+            for completed in done:
+                key, outcome = await completed
+                outcomes[key] = outcome
+                if isinstance(outcome, FlightsError) and outcome.code == "BOT_CHALLENGE":
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    raise outcome
+        finished = {task for task in pending if task.done()}
+        for completed in finished:
+            key, outcome = await completed
+            outcomes[key] = outcome
+        pending -= finished
+        if pending:
+            for task in pending:
+                task.cancel()
+                outcomes[tasks[task]] = ProviderError("PROVIDER_TIMEOUT", "Explore origin deadline reached", retryable=True)
+            await asyncio.gather(*pending, return_exceptions=True)
 
     grouped: dict[tuple[int, str], dict[str, Any]] = {}
-    seen_by_task: dict[tuple[int, int], set[tuple[int, str]]] = {}
     failures: list[dict[str, Any]] = []
     incomplete = False
     polls = 0
@@ -524,45 +523,41 @@ async def run_explore(
                 failure["country"] = _public_country(country_inputs[country_index], countries[country_index])
             failures.append(failure)
             continue
-        _, _, rows, tags, total, count, complete = outcome
-        provider_candidates += total
-        polls += count
-        incomplete |= not complete
-        seen_by_task[(country_index, origin_index)] = set()
-        for raw in rows:
-            content = raw["content"]
-            location = content["location"]
-            code = str(location["skyCode"]).upper()
+        _, _, snapshot = outcome
+        provider_candidates += snapshot.total_results
+        polls += snapshot.polls
+        incomplete |= not snapshot.complete
+        for provider_result in snapshot.results:
+            code = provider_result.code
             key = (country_index if level == "city" else 0, code)
+            public_continent = {"code": provider_result.continent_code, "name": provider_result.continent_name}
             if level == "country":
                 destination = {
-                    "level": "country", "code": code, "name": location["name"],
-                    "continent": location.get("continent"),
+                    "level": "country", "code": code, "name": provider_result.name,
+                    "continent": public_continent,
                 }
             else:
                 destination = {
-                    "level": "city", "code": code, "name": location["name"],
+                    "level": "city", "code": code, "name": provider_result.name,
                     "country": _public_country(country_inputs[country_index], countries[country_index]),
-                    "continent": location.get("continent"),
+                    "continent": public_continent,
                 }
             group = grouped.setdefault(key, {"destination": destination, "provider_tags": set(), "options": {}})
-            group["provider_tags"].update(tags.get(raw["id"], []))
-            quotes = content.get("flightQuotes") or {}
-            cheapest = _indicative_price(quotes.get("cheapest"), culture.currency)
-            direct = _indicative_price(quotes.get("direct"), culture.currency)
+            group["provider_tags"].update(provider_result.provider_tags)
+            cheapest = provider_result.cheapest_price
+            direct = provider_result.cheapest_direct_price
             if cheapest is None and direct is None:
                 continue
             nights, stay_match = _stay_annotation(req)
             option: dict[str, Any] = {
                 "origin": _public_label(original, origins[origin_index]), "state": "quoted",
                 "cheapest_price": cheapest, "cheapest_direct_price": direct,
-                "direct_flights_available": bool((content.get("flightRoutes") or {}).get("directFlightsAvailable")),
+                "direct_flights_available": provider_result.direct_flights_available,
                 "outbound_date": req["_depart_exact"].isoformat() if req.get("_depart_exact") else None,
                 "return_date": req["_return_exact"].isoformat() if req.get("_return_exact") else None,
-                "nights": nights, "stay_match": stay_match, "observed_at": None,
+                "nights": nights, "stay_match": stay_match, "observed_at": provider_result.observed_at,
             }
             group["options"][origin_index] = option
-            seen_by_task[(country_index, origin_index)].add(key)
 
     results: list[dict[str, Any]] = []
     direct_only = bool(req["filters"].get("direct_only"))
@@ -1153,12 +1148,8 @@ def _booking_options(raw: dict[str, Any], currency: str) -> list[dict[str, Any]]
             })
         total = option.get("price")
         if not isinstance(total, dict):
-            if len(normalized_items) == 1:
-                total_price = normalized_items[0]["price"]
-            else:
-                raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Multi-booking pricing option has no authoritative total")
-        else:
-            total_price = {"amount": decimal_string(total.get("raw", total.get("amount"))), "currency": currency}
+            raise ProviderError("PROVIDER_PROTOCOL_ERROR", "Pricing option has no authoritative total")
+        total_price = {"amount": decimal_string(total.get("raw", total.get("amount"))), "currency": currency}
         output.append({
             "total_price": total_price,
             "requires_multiple_bookings": len(normalized_items) > 1,

@@ -32,6 +32,28 @@ class Culture:
     currency: str = "PLN"
 
 
+@dataclass(frozen=True)
+class ExploreResult:
+    code: str
+    name: str
+    continent_code: str
+    continent_name: str
+    cheapest_price: dict[str, str] | None
+    cheapest_direct_price: dict[str, str] | None
+    direct_flights_available: bool
+    provider_tags: tuple[str, ...]
+    observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ExploreSnapshot:
+    results: list[ExploreResult]
+    total_results: int
+    complete: bool
+    session_id: str | None = None
+    polls: int = 0
+
+
 class SkyscannerWebProvider:
     def __init__(self, client: httpx.AsyncClient, *, culture: Culture = Culture(), retries: int = 2):
         self.client = client
@@ -218,7 +240,7 @@ class SkyscannerWebProvider:
         child_ages: list[int],
         cabin: str,
         deadline: float,
-    ) -> tuple[list[dict[str, Any]], dict[str, list[str]], int, int, bool]:
+    ) -> ExploreSnapshot:
         """Return provider Explore rows without exposing the provider collection shape."""
         view_id = str(uuid.uuid4())
         destination_ref = _explore_place(destination)
@@ -237,14 +259,11 @@ class SkyscannerWebProvider:
         data = await self._request(
             "POST", "/g/radar/api/v2/web-unified-search/", view_id=view_id, json=body, deadline=deadline
         )
-        rows, tags, complete, total = _explore_collection(data, expected=expected)
-        snapshot = rows
-        snapshot_tags = tags
+        snapshot = _explore_collection(data, expected=expected, currency=self.culture.currency)
         polls = 0
-        context = data[expected]["context"]
-        session_id = context.get("sessionId")
+        session_id = snapshot.session_id
         delay = 0.45
-        while not complete and isinstance(session_id, str) and time.monotonic() + delay < deadline:
+        while not snapshot.complete and isinstance(session_id, str) and time.monotonic() + delay < deadline:
             await asyncio.sleep(delay)
             data = await self._request(
                 "GET",
@@ -252,14 +271,26 @@ class SkyscannerWebProvider:
                 view_id=view_id,
                 deadline=deadline,
             )
-            current, current_tags, complete, total = _explore_collection(data, expected=expected)
-            if current:
-                snapshot, snapshot_tags = current, current_tags
+            current = _explore_collection(data, expected=expected, currency=self.culture.currency)
+            if current.results:
+                snapshot = current
             polls += 1
-            next_session = data[expected]["context"].get("sessionId")
-            session_id = next_session or session_id
+            session_id = current.session_id or session_id
+            if current.complete and not current.results:
+                snapshot = ExploreSnapshot(
+                    results=snapshot.results,
+                    total_results=current.total_results,
+                    complete=True,
+                    session_id=session_id,
+                )
             delay = min(2.5, delay * 1.6)
-        return snapshot, snapshot_tags, total, polls, complete
+        return ExploreSnapshot(
+            results=snapshot.results,
+            total_results=snapshot.total_results,
+            complete=snapshot.complete,
+            session_id=None,
+            polls=polls,
+        )
 
 
 def place_summary(place: dict[str, Any]) -> dict[str, Any]:
@@ -286,8 +317,8 @@ def _explore_place(place: dict[str, Any] | None) -> dict[str, str]:
 
 
 def _explore_collection(
-    data: Any, *, expected: str
-) -> tuple[list[dict[str, Any]], dict[str, list[str]], bool, int]:
+    data: Any, *, expected: str, currency: str = "PLN"
+) -> ExploreSnapshot:
     if not isinstance(data, dict) or not isinstance(data.get(expected), dict):
         raise ProviderError("CONTRACT_CHANGED", f"Radar Explore response has no {expected} object")
     collection = data[expected]
@@ -299,12 +330,37 @@ def _explore_collection(
         raise ProviderError("CONTRACT_CHANGED", f"Unknown Radar Explore status: {status!r}")
     if status == "incomplete" and not isinstance(context.get("sessionId"), str):
         raise ProviderError("CONTRACT_CHANGED", "Incomplete Radar Explore response has no sessionId")
+    features = collection.get("features")
+    if not isinstance(features, dict):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore response has no features object")
+    indicative = features.get("flightsIndicative")
+    if indicative not in {"AVAILABLE", "UNAVAILABLE"}:
+        raise ProviderError("CONTRACT_CHANGED", f"Unknown flightsIndicative status: {indicative!r}")
     results = collection.get("results")
     if not isinstance(results, list) or any(not isinstance(row, dict) for row in results):
         raise ProviderError("CONTRACT_CHANGED", "Radar Explore results must be a list of objects")
+    buckets = collection.get("buckets")
+    if not isinstance(buckets, list) or any(not isinstance(bucket, dict) for bucket in buckets):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore buckets must be a list of objects")
+    tags: dict[str, list[str]] = {}
+    for bucket in buckets:
+        category = bucket.get("category")
+        if category not in {"VIBES", "NON_CATEGORIZED"}:
+            raise ProviderError("CONTRACT_CHANGED", f"Unknown Radar Explore bucket category: {category!r}")
+        tag = bucket.get("id")
+        ids = bucket.get("resultIds")
+        if not isinstance(tag, str) or not isinstance(ids, list) or any(not isinstance(value, str) for value in ids):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore bucket is malformed")
+        if category == "VIBES":
+            for result_id in ids:
+                tags.setdefault(result_id, []).append(tag)
     locations = []
+    expected_location_type = "City" if expected == "countryDestination" else "Nation"
     for row in results:
-        if row.get("type") != "LOCATION":
+        row_type = row.get("type")
+        if row_type not in {"LOCATION", "ADVERT", "ADVERTISEMENT"}:
+            raise ProviderError("CONTRACT_CHANGED", f"Unknown Radar Explore result type: {row_type!r}")
+        if row_type != "LOCATION":
             # Explore interleaves ads and other presentation cards with locations.
             continue
         content = row.get("content")
@@ -313,24 +369,46 @@ def _explore_collection(
             raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has no public location data")
         if not isinstance(location.get("name"), str) or not isinstance(location.get("skyCode"), str):
             raise ProviderError("CONTRACT_CHANGED", "Radar Explore location has no name or skyCode")
-        locations.append(row)
-    buckets = collection.get("buckets", [])
-    if not isinstance(buckets, list) or any(not isinstance(bucket, dict) for bucket in buckets):
-        raise ProviderError("CONTRACT_CHANGED", "Radar Explore buckets must be a list of objects")
-    tags: dict[str, list[str]] = {}
-    for bucket in buckets:
-        if bucket.get("category") != "VIBES":
-            continue
-        tag = bucket.get("id")
-        ids = bucket.get("resultIds", [])
-        if not isinstance(tag, str) or not isinstance(ids, list) or any(not isinstance(value, str) for value in ids):
-            raise ProviderError("CONTRACT_CHANGED", "Radar Explore vibe bucket is malformed")
-        for result_id in ids:
-            tags.setdefault(result_id, []).append(tag)
+        if location.get("type") != expected_location_type:
+            raise ProviderError("CONTRACT_CHANGED", f"Unexpected Radar Explore location type: {location.get('type')!r}")
+        continent = location.get("continent")
+        if not isinstance(continent, dict) or not isinstance(continent.get("code"), str) or not isinstance(continent.get("name"), str):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore location has no public continent")
+        quotes = content.get("flightQuotes")
+        routes = content.get("flightRoutes")
+        if not isinstance(quotes, dict) or not isinstance(routes, dict) or not isinstance(routes.get("directFlightsAvailable"), bool):
+            raise ProviderError("CONTRACT_CHANGED", "Radar Explore result has malformed quotes or routes")
+        cheapest = _explore_price(quotes.get("cheapest"), currency)
+        direct = _explore_price(quotes.get("direct"), currency)
+        locations.append(ExploreResult(
+            code=location["skyCode"].upper(),
+            name=location["name"],
+            continent_code=continent["code"],
+            continent_name=continent["name"],
+            cheapest_price=cheapest,
+            cheapest_direct_price=direct,
+            direct_flights_available=routes["directFlightsAvailable"],
+            provider_tags=tuple(sorted(tags.get(row["id"], []))),
+        ))
     total = context.get("totalResults", len(results))
     if not isinstance(total, int) or isinstance(total, bool) or total < 0:
         raise ProviderError("CONTRACT_CHANGED", "Radar Explore totalResults must be a non-negative integer")
-    return locations, tags, status == "complete", total
+    return ExploreSnapshot(
+        results=locations,
+        total_results=total,
+        complete=status == "complete",
+        session_id=context.get("sessionId"),
+    )
+
+
+def _explore_price(value: Any, currency: str) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("rawPrice") is None:
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore quote has no rawPrice")
+    if "direct" in value and not isinstance(value["direct"], bool):
+        raise ProviderError("CONTRACT_CHANGED", "Radar Explore quote direct flag must be boolean")
+    return {"amount": decimal_string(value["rawPrice"]), "currency": currency}
 
 
 def _alt_session_incomplete(status: str) -> bool:

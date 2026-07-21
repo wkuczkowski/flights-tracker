@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,7 +9,7 @@ import pytest
 
 from flights_tracker.cli import dispatch, parser
 from flights_tracker.errors import FlightsError, ProviderError
-from flights_tracker.provider import SkyscannerWebProvider, _explore_collection
+from flights_tracker.provider import ExploreResult, ExploreSnapshot, _explore_collection
 from flights_tracker.service import run_explore, validate_explore_request
 
 
@@ -54,6 +53,7 @@ def autosuggest(query: str) -> dict:
     values = {
         "WAW": {"PlaceName": "Warszawa", "IataCode": "WAW", "GeoId": "origin-waw", "CountryId": "PL"},
         "POZ": {"PlaceName": "Poznań", "IataCode": "POZ", "GeoId": "origin-poz", "CountryId": "PL"},
+        "GDN": {"PlaceName": "Gdańsk", "IataCode": "GDN", "GeoId": "origin-gdn", "CountryId": "PL"},
         "IT": {"PlaceName": "Włochy", "GeoId": "country-it", "CountryId": "IT", "CountryName": "Włochy"},
     }
     return values[query]
@@ -85,19 +85,47 @@ def test_explore_parser_requires_structured_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_dispatches_explore_request(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_cli_dispatches_real_explore_seam_with_mixed_scopes_and_partial_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    req = request()
+    req["trip"] = {
+        "type": "round_trip",
+        "depart": {"scope": "month", "month": "2026-09"},
+        "return": {"scope": "anytime"},
+    }
     path = tmp_path / "request.json"
-    path.write_text(json.dumps(request()))
-    seen = {}
+    path.write_text(json.dumps(req))
 
-    async def fake(req, **kwargs):
-        seen.update(req)
-        return {"schema_version": "1.0", "status": "complete", "results": []}
+    class FakeProvider:
+        def __init__(self, client, *, culture):
+            self.culture = culture
 
-    monkeypatch.setattr("flights_tracker.cli.run_explore", fake)
+        async def resolve_place(self, query, *, destination=False):
+            return autosuggest(query)
+
+        async def explore_one(self, origin, destination, **kwargs):
+            assert kwargs["depart"] == {"@type": "month", "year": "2026", "month": "09"}
+            assert kwargs["return_date"] == {"@type": "anytime"}
+            if origin["GeoId"] == "origin-poz":
+                raise ProviderError("PROVIDER_TIMEOUT", "timed out", retryable=True)
+            return ExploreSnapshot(
+                results=[ExploreResult(
+                    code="IT", name="Włochy", continent_code="EU", continent_name="Europa",
+                    cheapest_price={"amount": "250.00", "currency": "PLN"},
+                    cheapest_direct_price=None, direct_flights_available=False,
+                    provider_tags=("GREAT_FOOD",),
+                )],
+                total_results=1,
+                complete=True,
+            )
+
+    monkeypatch.setattr("flights_tracker.service.SkyscannerWebProvider", FakeProvider)
     output = await dispatch(parser().parse_args(["explore", "--request", str(path), "--json"]))
-    assert output["status"] == "complete"
-    assert seen["destination_scope"]["level"] == "country"
+    assert output["status"] == "partial"
+    assert output["query"]["trip"] == req["trip"]
+    assert [option["state"] for option in output["results"][0]["origin_options"]] == ["quoted", "failed"]
+    assert output["partial_failures"] == [{"origin": "POZ", "code": "PROVIDER_TIMEOUT", "retryable": True}]
 
 
 @pytest.mark.parametrize(
@@ -130,12 +158,30 @@ def test_explore_date_scopes_map_to_provider_contract() -> None:
 
 
 def test_provider_contract_fixture_is_sanitized_and_strict() -> None:
-    rows, tags, complete, total = _explore_collection(fixture("explore_everywhere.json"), expected="everywhereDestination")
-    assert complete and total == 2
-    assert rows[0]["content"]["location"]["skyCode"] == "IT"
-    assert tags["result-it"] == ["BEACH", "GREAT_FOOD"]
+    snapshot = _explore_collection(fixture("explore_everywhere.json"), expected="everywhereDestination")
+    assert snapshot.complete and snapshot.total_results == 2
+    assert snapshot.results[0].code == "IT"
+    assert (snapshot.results[0].continent_code, snapshot.results[0].continent_name) == ("EU", "Europa")
+    assert snapshot.results[0].provider_tags == ("BEACH", "GREAT_FOOD")
+    assert "private-continent" not in repr(snapshot.results)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda data: data["everywhereDestination"].pop("context"),
+    lambda data: data["everywhereDestination"].pop("features"),
+    lambda data: data["everywhereDestination"]["features"].update(flightsIndicative="MYSTERY"),
+    lambda data: data["everywhereDestination"].update(results={}),
+    lambda data: data["everywhereDestination"]["results"][0].update(type="MYSTERY"),
+    lambda data: data["everywhereDestination"]["results"][0]["content"]["location"].update(type="Region"),
+    lambda data: data["everywhereDestination"]["buckets"][0].update(category="MYSTERY"),
+    lambda data: data["everywhereDestination"]["results"][0]["content"]["flightQuotes"]["cheapest"].pop("rawPrice"),
+    lambda data: data["everywhereDestination"]["results"][0]["content"]["flightRoutes"].update(directFlightsAvailable="yes"),
+])
+def test_provider_contract_rejects_missing_fields_unknown_enums_and_shape_drift(mutation) -> None:
+    payload = fixture("explore_everywhere.json")
+    mutation(payload)
     with pytest.raises(ProviderError):
-        _explore_collection({"everywhereDestination": {"results": {}}}, expected="everywhereDestination")
+        _explore_collection(payload, expected="everywhereDestination")
 
 
 @pytest.mark.asyncio
@@ -151,7 +197,7 @@ async def test_country_explore_groups_origins_sorts_and_never_leaks_private_ids(
     assert italy["origin_options"][0]["stay_match"] is True
     assert response["results"][1]["origin_options"][1]["state"] == "no_quote"
     serialized = json.dumps(response)
-    assert "private-it" not in serialized and "origin-waw" not in serialized and "result-it" not in serialized
+    assert all(private not in serialized for private in ("private-it", "private-continent", "origin-waw", "result-it"))
 
 
 @pytest.mark.asyncio
@@ -188,6 +234,50 @@ async def test_partial_origin_failure_is_explicit_while_no_quote_is_not_failure(
     assert response["status"] == "partial"
     assert response["partial_failures"][0]["origin"] == "POZ"
     assert response["results"][0]["origin_options"][1] == {"origin": "POZ", "state": "failed", "error": {"code": "PROVIDER_UNAVAILABLE", "retryable": True}}
+
+
+@pytest.mark.asyncio
+async def test_completed_origin_survives_when_other_origin_hits_overall_deadline() -> None:
+    async def handler(call: httpx.Request) -> httpx.Response:
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=[autosuggest(query)])
+        origin_id = json.loads(call.content)["legs"][0]["legOrigin"]["entityId"]
+        if origin_id == "origin-poz":
+            await __import__("asyncio").sleep(1)
+        return httpx.Response(200, json=fixture("explore_everywhere.json"))
+
+    req = request()
+    req["timeout"] = 0.1
+    response = await run_explore(req, transport=httpx.MockTransport(handler))
+    assert response["status"] == "partial"
+    assert response["results"]
+    assert response["results"][0]["origin_options"][0]["state"] == "quoted"
+    assert response["results"][0]["origin_options"][1]["error"]["code"] == "PROVIDER_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_waw_poz_gdn_success_timeout_503_matrix() -> None:
+    def handler(call: httpx.Request) -> httpx.Response:
+        if "autosuggest" in call.url.path:
+            query = call.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=[autosuggest(query)])
+        origin_id = json.loads(call.content)["legs"][0]["legOrigin"]["entityId"]
+        if origin_id == "origin-poz":
+            raise httpx.ReadTimeout("simulated timeout")
+        if origin_id == "origin-gdn":
+            return httpx.Response(503, json={"error": "temporary"})
+        return httpx.Response(200, json=fixture("explore_everywhere.json"))
+
+    req = request()
+    req["origins"].append({"iata": "GDN"})
+    req["timeout"] = 10
+    response = await run_explore(req, transport=httpx.MockTransport(handler))
+    assert response["status"] == "partial"
+    assert {(failure["origin"], failure["code"]) for failure in response["partial_failures"]} == {
+        ("POZ", "PROVIDER_TIMEOUT"), ("GDN", "PROVIDER_UNAVAILABLE"),
+    }
+    assert [option["state"] for option in response["results"][0]["origin_options"]] == ["quoted", "failed", "failed"]
 
 
 @pytest.mark.asyncio

@@ -155,6 +155,16 @@ def test_single_item_booking_option_remains_in_deprecated_agents() -> None:
     assert normalized["booking_options"][0]["total_price"]["amount"] == "10.00"
 
 
+def test_single_item_without_authoritative_option_total_is_protocol_error() -> None:
+    raw = {
+        "price": {"raw": 10}, "legs": [], "_agent_lookup": {"a": {"name": "Agent A"}},
+        "pricingOptions": [{"items": [{"agentId": "a", "price": {"raw": 10}}]}],
+    }
+    with pytest.raises(ProviderError) as caught:
+        _booking_options(raw, "PLN")
+    assert "authoritative total" in caught.value.message
+
+
 def test_missing_agent_reference_is_protocol_error() -> None:
     with pytest.raises(ProviderError):
         _agents({"price": {"raw": 1}, "pricingOptions": [{"items": [{"agentId": "missing"}]}], "_agent_lookup": {}}, "PLN")

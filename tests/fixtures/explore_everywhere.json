@@ -12,7 +12,7 @@
         "id": "result-it",
         "type": "LOCATION",
         "content": {
-          "location": {"id": "private-it", "skyCode": "IT", "name": "Włochy", "type": "Nation", "continent": {"code": "EU", "name": "Europa"}},
+          "location": {"id": "private-it", "skyCode": "IT", "name": "Włochy", "type": "Nation", "continent": {"id": "private-continent", "code": "EU", "name": "Europa"}},
           "flightQuotes": {"cheapest": {"rawPrice": 259.0, "direct": true}, "direct": {"rawPrice": 259.0, "direct": true}},
           "flightRoutes": {"directFlightsAvailable": true}
         }
@@ -21,7 +21,7 @@
         "id": "result-es",
         "type": "LOCATION",
         "content": {
-          "location": {"id": "private-es", "skyCode": "ES", "name": "Hiszpania", "type": "Nation", "continent": {"code": "EU", "name": "Europa"}},
+          "location": {"id": "private-es", "skyCode": "ES", "name": "Hiszpania", "type": "Nation", "continent": {"id": "private-continent", "code": "EU", "name": "Europa"}},
           "flightQuotes": {"cheapest": {"rawPrice": 349.5, "direct": false}},
           "flightRoutes": {"directFlightsAvailable": false}
         }
